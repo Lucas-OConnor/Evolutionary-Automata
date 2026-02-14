@@ -22,13 +22,13 @@
 #define SLEEP_VEL_EPS       0.02f
 #define SLEEP_FRAMES        30
 
-#define MAX_NODES           256
+#define MAX_NODES           1024
 #define MAX_BODIES          40
-#define MAX_EDGES           1024
-#define MAX_FACES           1024
+#define MAX_EDGES           2048
+#define MAX_FACES           2048
 #define NODES_PER_BODY      50
 #define EDGES_PER_BODY      1000
-#define ADJ_MAX             12
+#define ADJ_MAX             14
 
 #define EDGEKEY_EMPTY   0xFFFFFFFFu
 #define EDGEKEY_TOMB    0xFFFFFFFEu
@@ -96,10 +96,7 @@ typedef struct {
 typedef struct {
     int   linearity; //Number of neighboring nodes each node optimally wants to attach to
     float linearityBias; //Multiplier for linearity variance; how 'picky' linearity is
-    float sameDepthBias; //Positive or negative multiplier on how likely a node is to form a link with a similar depth node
-    float depthBias; //Multiplier on *parent* depth; negative values prefer low depth (old cells close to the heart), positive prefers high depth (new cells far from the heart)
     float skeletal; //Pre-edge-choice bias to form bone edges when neighboring another bone edge; 0 means normal distribution
-    float depthBoneBias; //Positive or negative multiplier on a pre-edge bias to form bone edges when linking to a low depth node
     float boneP; float muscleP; float tendonP; //Normal probabilities of each edge type generating; when setting, ensure sums to 1
 } Genetics;
 
@@ -108,12 +105,11 @@ typedef struct {
     Vec3  vel;              // 3D velocity
     Vec3  force;            // accumulator each tick
     float invMass;          // 0 = fixed, else 1/mass
-    uint16_t owner;         // organism id (optional for now)
+    uint16_t owner;         // organism id
     NodeType type;
     float radius;
     uint8_t alive;
     uint8_t distHeart;      // number of nodes in the shortest path to the heart node (heart is 1, disconnected is 0)
-    uint8_t depth;          // distHeart on creation ('intended')
     Vec3Int lattice;        // skeleton lattice coordinates
 } Node;
 static float    gNodePos_Type[3][MAX_DRAW_NODES * 18];
@@ -164,6 +160,10 @@ typedef struct {
 
     uint32_t faceHashKey[FACEHASH_CAP];
     uint16_t faceHashVal[FACEHASH_CAP];
+
+    uint16_t jointCandIdx[NODES_PER_BODY];
+    uint16_t jointCandCount;
+    int16_t jointCandSlot[NODES_PER_BODY];
 
     uint16_t id;
 
@@ -260,6 +260,7 @@ static inline void v3Zero(Vec3* v) { v->x = v->y = v->z = 0.0f; }
 static inline Vec3Int v3Int(int x, int y, int z) { Vec3Int v = {x,y,z}; return v;}
 static inline Vec3Int v3IntAdd(Vec3Int a, Vec3Int b) {return v3Int(a.x+b.x, a.y+b.y, a.z+b.z);}
 static inline Vec3Int v3IntSub(Vec3Int a, Vec3Int b) {return v3Int(a.x-b.x, a.y-b.y, a.z-b.z);}
+static inline Vec3Int v3IntScale(Vec3Int a, int b) {return v3Int(a.x*b, a.y*b, a.z*b);}
 static inline int v3IntDotSq(Vec3Int a) {return (int)a.x*a.x + (int)a.y*a.y + (int)a.z*a.z;}
 static inline int v3IntDist2(Vec3Int a, Vec3Int b) { return v3IntDotSq(v3Int(b.x-a.x, b.y-a.y, b.z-a.z));}
 static inline Vec3 v3IntTov3(Vec3Int a) {return v3((float)a.x, (float)a.y, (float)a.z);}
@@ -830,6 +831,21 @@ static inline void nodeAlive(Body *b, Node *n, int8_t is) {
         b->topoDirty = 1;
     }
 }
+static inline void jointCandRemove(Body *b, uint16_t n){
+    int16_t slot = b->jointCandSlot[n];
+    if (slot < 0) return;
+    uint16_t last = b->jointCandIdx[--b->jointCandCount];
+    if ((uint16_t)slot != b->jointCandCount){
+        b->jointCandIdx[slot] = last;
+        b->jointCandSlot[last] = slot;
+    }
+    b->jointCandSlot[n] = -1;
+}
+static inline void jointCandAdd(Body *b, uint16_t n){
+    if (b->jointCandSlot[n] >= 0) return;
+    b->jointCandSlot[n] = (int16_t)b->jointCandCount;
+    b->jointCandIdx[b->jointCandCount++] = n;
+}
 
 static void computeBoneDegree(Body *b) {
     memset(b->boneDeg, 0, (size_t)b->nodeCount * sizeof(b->boneDeg[0]));
@@ -1065,8 +1081,6 @@ static EdgeType pickEdgeType(const Body *b, int a, int c) {
     float pB = b->genes.boneP, pT = b->genes.tendonP, pM = b->genes.muscleP; //edge type base probabilities
     //int ba = b->boneDeg[a], bc = b->boneDeg[c]; int be = ba + bc; //neighboring bone edge counts
     //float XBoneP = b->genes.skeletal * -be; //extra bone probability based on neighboirng bone edges
-    //int da = b->nodes[a].depth, dc = b->nodes[c].depth; //neighboring node depths
-    //float depthTerm = b->genes.depthBoneBias * -(da + dc) * 0.5f; //depth based bone chance term
 
     float r = frand01();
     if (r < pB) return EDGE_BONE;
@@ -1114,10 +1128,8 @@ static void randomLinks(Body *b, int extraEdges) {
         for (int tries = 0; tries < 8; ++tries) {
             int c = rand() % b->nodeCount;
             if (c == a || !b->nodes[c].alive) continue;
-            int dh = abs((int)b->nodes[a].distHeart - (int)b->nodes[c].distHeart);
-            float score = -b->genes.sameDepthBias * (float)dh;
             float d = v3Dist(b->nodes[a].pos, b->nodes[c].pos);
-            score += -0.5f * d;
+            float score = -0.5f * d;
             if (score > bestScore) {bestScore = score; best = c;}
         }
         if (best >= 0) addEdge(b, a, c, pickEdgeType(b, a, c));
@@ -1131,68 +1143,69 @@ static inline float parentScore(Body *b, int childIdx, int parentIdx) {
 
     float linearity = 2 + g->linearityBias * -(float)abs(b->adjCount[parentIdx] - g->linearity);
 
-    float depth = 2 * g->depthBias * (float)parent->depth;
+    return linearity;
+}
+static uint16_t seedNode(Body *b, Vec3Int lattice, NodeType t) {
+    if (b->nodeCount >= NODES_PER_BODY) return UINT16_MAX;
+    if (nodeHashGet(b, lattice) > 0) return UINT16_MAX;
 
-    return linearity + depth;
-}
-static void seedNode(Body *b, int i, int parent, float spread, NodeType t) {
-    b->nodes[i].depth = b->nodes[parent].depth + 1;
-    b->nodes[i].alive  = 1;
-    b->nodes[i].pos = v3Add(b->nodes[parent].pos, v3Scale(v3Rand(), spread));
-    b->nodes[i].vel = v3(0,0,0); 
-    b->nodes[i].force = v3(0,0,0);
-    b->nodes[i].distHeart = 0;
-    b->nodes[i].owner = (uint16_t)b->id;
+    uint16_t i = b->nodeCount++;
+    Node *n = &b->nodes[i];
+    memset(n, 0, sizeof(*n));
+    n->alive  = 1;
+    n->owner = (uint16_t)b->id;
+    n->lattice = lattice;
+    n->pos = v3Add(b->nodes[0].pos, v3Scale(v3IntTov3(lattice), REST_LEN));
+    n->vel = v3(0,0,0); 
+    n->force = v3(0,0,0);
+    n->distHeart = 0;
+    
     setNodeType(b, &b->nodes[i], t);
+    nodeHashPut(b, n->lattice, i);
+
+    return i;
 }
-static void seedNodes(Body *b, Vec3 center, float spread) {
-    seedNode(b, 0, 0, spread, NODE_HEART);
-    b->nodes[0].depth = 0;
-    b->nodes[0].pos = center;
-    int lastNode = b->nodeCount-1;
-    for (int i=1;i<lastNode;i++) {
-        int parentBest = rand() % i;
-        float scoreBest = parentScore(b, i, parentBest);
-        for (int j=1; j<=3; ++j) {
-            int parent = rand() % i;
-            int score = parentScore(b, i, parent);
-            if (score > scoreBest) {
-                parentBest = parent;
-                scoreBest = score;
-            }
-        }
-        
-        seedNode(b, i, parentBest, spread, NODE_NORMAL);
-        addEdge(b, i, parentBest, pickEdgeType(b, i, parentBest));
-    }
-    int parent = rand() % lastNode;
-    seedNode(b, lastNode, parent, spread, NODE_WEAPON);
-    addEdge(b, lastNode, parent, pickEdgeType(b, lastNode, parent));
+static int seedNewBoneonNode(Body *b, uint16_t J) {
+    if (!b->nodes[J].alive) return 0;
+    if (b->nodeCount + 3 > NODES_PER_BODY) return 0;
+    if (b->adjCount[J] > 3) return 0;
+
+    uint16_t A = b->adjNode[J][0], B = b->adjNode[J][1], C = b->adjNode[J][2];
+    Vec3Int Jc = b->nodes[J].lattice;
+
+    Vec3Int Ap = v3IntSub(v3IntScale(Jc,2), b->nodes[A].lattice);
+    Vec3Int Bp = v3IntSub(v3IntScale(Jc,2), b->nodes[B].lattice);
+    Vec3Int Cp = v3IntSub(v3IntScale(Jc,2), b->nodes[C].lattice);
+
+    uint16_t iAp = seedNode(b, Ap, NODE_NORMAL);
+    uint16_t iBp = seedNode(b, Bp, NODE_NORMAL);
+    uint16_t iCp = seedNode(b, Cp, NODE_NORMAL);
+    if (iAp==UINT16_MAX || iBp==UINT16_MAX || iCp==UINT16_MAX) return 0;
+
+    addEdge(b, J,   iAp, EDGE_BONE);
+    addEdge(b, J,   iBp, EDGE_BONE);
+    addEdge(b, J,   iCp, EDGE_BONE);
+    addEdge(b, iAp, iBp, EDGE_BONE);
+    addEdge(b, iBp, iCp, EDGE_BONE);
+    addEdge(b, iCp, iAp, EDGE_BONE);
+
+    toggleFrontierFace(b, iAp, iBp, iCp, J);
+
+    return 1;
 }
 static int seedNodeonFace(Body *b, int faceIndex) {
     Face *f = &b->frontier[faceIndex];
     if (!f->alive) return 0;
     if (b->nodeCount >= NODES_PER_BODY) return 0;
     Vec3Int apex;
-    if (!findOutsideApexCoord_CubicTets(b, f->a, f->b, f->c, f->inside, &apex) || nodeHashGet(b, apex) >= 0){
+    if (!findOutsideApexCoord_CubicTets(b, f->a, f->b, f->c, f->inside, &apex)){
         f->alive = 0;
         b->topoDirty = 1;
         return 0;
     }
     toggleFrontierFace(b, f->a, f->b, f->c, f->inside);
 
-    int ni = b->nodeCount++;
-    Node *n = &b->nodes[ni];
-    memset(n, 0, sizeof(*n));
-    n->alive = 1;
-    n->owner = (uint16_t)b->id;
-    n->lattice = apex;
-    Vec3 origin = b->nodes[0].pos;
-    n->pos = v3Add(origin, v3Scale(v3IntTov3(apex), REST_LEN));
-    n->depth = 1 + (uint8_t)fminf(b->nodes[f->a].depth, fminf(b->nodes[f->b].depth, b->nodes[f->c].depth));
-    n->distHeart = 0;
-    setNodeType(b, n, NODE_NORMAL);
-    nodeHashPut(b, apex, ni);
+    uint16_t ni = seedNode(b, apex, NODE_NORMAL);
 
     addEdge(b, ni, f->a, EDGE_BONE /*pickEdgeType(b, ni, f->a)*/);
     addEdge(b, ni, f->b, EDGE_BONE /*pickEdgeType(b, ni, f->b)*/);
@@ -1203,40 +1216,30 @@ static int seedNodeonFace(Body *b, int faceIndex) {
     toggleFrontierFace(b, f->b, f->c, ni, f->a);
     toggleFrontierFace(b, f->c, f->a, ni, f->b);
 
+    jointCandRemove(b, f->a);
+    jointCandRemove(b, f->b);
+    jointCandRemove(b, f->c);
+    jointCandAdd(b, ni);
+
     b->topoDirty = 1;
     wakeBody(b);
     return 1;
 }
-static void seedSkeletonLattice(Body *b, Vec3 center) {
+static void skeletonLattice(Body *b, Vec3 center) {
     b->edgeCount = 0;
     b->activeEdgeCount = 0;
     b->faceCount = 0;
-    b->topoDirty = 1;
-    for (int i=0; i<b->nodeCount; ++i) b->adjCount[i] = 0;
-    for (int i=0; i<EDGEHASH_CAP; ++i) b->edgeHashKey[i] = EDGEKEY_EMPTY;
-    for (int i=0; i<NODEHASH_CAP; ++i) b->nodeHashKey[i] = NODEKEY_EMPTY;
-    for (int i=0; i<FACEHASH_CAP; ++i) b->faceHashKey[i] = FACEKEY_EMPTY;
+    b->jointCandCount = 0;
+    b->nodeCount = 0;
 
-    b->nodeCount = 4;
+    
+    seedNode(b, v3Int(0,0,0), NODE_HEART);
+    b->nodes[0].pos = center;
+    seedNode(b, v3Int(1,0,0), NODE_NORMAL);
+    seedNode(b, v3Int(1,1,0), NODE_NORMAL);
+    seedNode(b, v3Int(1,1,1), NODE_NORMAL);
 
-    Vec3Int P[4] = {
-        {0,0,0}, {1,0,0}, {1,1,0}, {1,1,1}
-    };
-
-    for (int i=0; i<4; ++i) {
-        Node *n = &b->nodes[i];
-        memset(n, 0, sizeof(*n));
-        n->alive = 1;
-        n->owner = (uint16_t)b->id;
-        n->lattice = P[i];
-        n->vel = v3(0,0,0);
-        n->force = v3(0,0,0);
-        n->distHeart = 0;
-        n->depth = (i==0) ? 0 : 1;
-        n->pos = v3Add(center, v3Scale(v3IntTov3(P[i]), REST_LEN));
-        setNodeType(b, n, (i==0) ? NODE_HEART : NODE_NORMAL);
-        nodeHashPut(b, n->lattice, i);
-    }
+    jointCandAdd(b, 0); jointCandAdd(b, 1); jointCandAdd(b, 2); jointCandAdd(b, 3);
 
     addEdge(b, 0,1, EDGE_BONE); addEdge(b, 0,2, EDGE_BONE); addEdge(b, 0,3, EDGE_BONE); addEdge(b, 1,2, EDGE_BONE); addEdge(b, 1,3, EDGE_BONE); addEdge(b, 2,3, EDGE_BONE);
     toggleFrontierFace(b, 1,2,3, 0); toggleFrontierFace(b, 0,2,3, 1); toggleFrontierFace(b, 0,1,3, 2); toggleFrontierFace(b, 0,1,2, 3);
@@ -1247,24 +1250,23 @@ static void seedSkeletonLattice(Body *b, Vec3 center) {
     }
 
     while (b->nodeCount < NODES_PER_BODY) {
-        int tries = 0;
-        int fi = -1;
-        while (tries++ < 64) {
-            int r = rand() % b->faceCount;
-            if (b->frontier[r].alive) {fi = r; break;}
-        }
-        if (fi < 0) break;
-        seedNodeonFace(b, fi);
+            if (rand() % 6 > 0 && b->jointCandCount > 0) {
+            int tries = 0;
+            int fi = -1;
+            while (tries++ < 64) {
+                int r = rand() % b->faceCount;
+                if (b->frontier[r].alive) {fi = r; break;}
+            }
+            if (fi < 0) break;
+            seedNodeonFace(b, fi);
+        } else {seedNewBoneonNode(b, b->jointCandIdx[rand() % b->jointCandCount]);}
     }
     computeBoneDegree(b);
 }
 static void generateDNA(Genetics *g) {
     g->linearity = irandRange(1, ADJ_MAX);
     g->linearityBias = frand01();
-    g->sameDepthBias = frandRange(-1.0f, 2.0f);
-    g->depthBias = frandRange(-1.0f, 1.0f);
     g->skeletal = frand01();
-    g->depthBoneBias = frand01();
     float cut1 = frand01(), cut2 = frand01();
     if (cut1 > cut2) {float temp=cut1; cut1=cut2; cut2=temp;}
     g->boneP = cut1; g->tendonP = cut2-cut1; g->muscleP = 1-cut2;
@@ -1273,9 +1275,8 @@ static void makeRandomOrganism(int slot, Vec3 center) {
     Body *b = &gBodies[slot];
     Genetics *g = &b->genes;
     b->id = (uint16_t)(slot + 1);
-    b->nodeCount = NODES_PER_BODY;
     b->edgeCount = 0; b->activeEdgeCount = 0;
-    for (int i=0; i<b->nodeCount; ++i) b->adjCount[i] = 0;
+    for (int i=0; i<NODES_PER_BODY; ++i) b->adjCount[i] = 0;
     for (int i=0; i<EDGEHASH_CAP; ++i) {
         b->edgeHashKey[i] = EDGEKEY_EMPTY;
         b->edgeHashVal[i] = 0;
@@ -1288,14 +1289,14 @@ static void makeRandomOrganism(int slot, Vec3 center) {
         b->faceHashKey[i] = FACEKEY_EMPTY;
         b->faceHashVal[i] = 0;
     }
+    for (int i=0; i<NODES_PER_BODY; ++i) b->jointCandSlot[i] = -1;
     b->sleeping = 0;
     b->sleepFrames = 0;
     b->topoDirty = 1;
 
     generateDNA(g);
 
-    seedSkeletonLattice(b, center);
-    //seedNodes(b, center, 0.35f);                // spread
+    skeletonLattice(b, center);
     //randomLinks(b, 8 + (rand()%6));             // 8–13 extra edges
 
     bodyBounds(b);
@@ -1583,9 +1584,10 @@ int main(int argc, char **argv) {
 }
 
 /* TO DO
-    finish skeletal lattice generation
-    split skeleton lattice generation into 'bones' that are connected by one node and thus not rotationally constrained
-    reenable muscle and tendon generation
+    force generation of tendons around joints; increase spring strength significantly, hopefully enough to prevent inverting
+    Tag joints and check for collision solving every so often
+    add bone formation vs bone growth probabilities to DNA and impliment
+    reenable muscle generation
     add ambient sensory inputs such as proximity to nodes of interest to allow future implimentation of basic behaviors
     add food and hunger stimulation for a simple goal; possibly force seperated nodes to become bodyless food nodes instead of vanishing
     complete generateDNA and impliment genetics for greater diversity and an evolutionary and reproductive basis
