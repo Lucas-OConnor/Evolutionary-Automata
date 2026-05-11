@@ -9,26 +9,31 @@
 #include <math.h>
 #include <xmmintrin.h>
 
-#define PI                  acos(-1.0)
+#define PI                      acos(-1.0)
 
-#define WIN_W               1200
-#define WIN_H               700
-#define WORLD_X             8.0f
-#define WORLD_Y             8.0f
-#define WORLD_Z             8.0f
+#define WIN_W                   1200
+#define WIN_H                   700
+#define WORLD_X                 50.0f
+#define WORLD_Y                 50.0f
+#define WORLD_Z                 50.0f
 
-#define GLOBAL_DAMPING      0.15f
+#define GLOBAL_DAMPING          0.15f
 
-#define SLEEP_VEL_EPS       0.02f
-#define SLEEP_FRAMES        30
+#define SLEEP_VEL_EPS           0.02f
+#define SLEEP_FRAMES            30
 
-#define MAX_NODES           1024
-#define MAX_BODIES          40
-#define MAX_EDGES           2048
-#define MAX_FACES           2048
-#define NODES_PER_BODY      50
-#define EDGES_PER_BODY      1000
-#define ADJ_MAX             14
+#define MAX_NODES               1024
+#define MAX_BODIES              40
+#define MAX_EDGES               2048
+#define MAX_FACES               2048
+#define MAX_ARMATURES           512
+#define MAX_TETS                2048
+#define ARMATURES_PER_BODY      2
+#define NODES_PER_BODY          100
+#define ADJ_MAX                 14
+#define EDGES_PER_BODY          (6 * NODES_PER_BODY + 2 * NODES_PER_BODY)
+#define MAX_NODES_PER_ARMATURE  64
+
 
 #define EDGEKEY_EMPTY   0xFFFFFFFFu
 #define EDGEKEY_TOMB    0xFFFFFFFEu
@@ -105,7 +110,7 @@ typedef struct {
     Vec3  vel;              // 3D velocity
     Vec3  force;            // accumulator each tick
     float invMass;          // 0 = fixed, else 1/mass
-    uint16_t owner;         // organism id
+    uint16_t armatureID;    // skeletal rigidbody ID
     NodeType type;
     float radius;
     uint8_t alive;
@@ -140,6 +145,21 @@ typedef struct {
 } Face;
 
 typedef struct {
+    uint16_t armatureID;
+    uint16_t nodeCount;
+    uint16_t nodes[MAX_NODES_PER_ARMATURE];
+
+    Vec3 center;
+    float radius;
+} Armature;
+
+typedef struct {
+    uint16_t a, b, c, d;
+    uint16_t armatureID;
+    uint16_t alive;
+} Tetra;
+
+typedef struct {
     Node nodes[NODES_PER_BODY]; 
     int nodeCount;
     Edge edges[EDGES_PER_BODY]; 
@@ -165,6 +185,12 @@ typedef struct {
     uint16_t jointCandCount;
     int16_t jointCandSlot[NODES_PER_BODY];
 
+    Armature armatures[MAX_ARMATURES];
+    uint16_t armatureCount;
+
+    Tetra tets[MAX_TETS];
+    uint16_t tetCount;
+
     uint16_t id;
 
     uint8_t sleepFrames;
@@ -172,6 +198,8 @@ typedef struct {
 
     uint8_t topoDirty;
     uint8_t boneDeg[NODES_PER_BODY];
+
+    uint16_t nextArmatureID;
 
     Vec3 bsCenter;
     float bsRadius;
@@ -194,6 +222,8 @@ static Vec3 gCamNode[MAX_BODIES][NODES_PER_BODY];
 static float gCamTrim[MAX_BODIES][NODES_PER_BODY];
 static float gProjKx = 1.0f;
 static float gProjKy = 1.0f;
+
+static float gSimTime = 0.0f;
 
 static const uint8_t EDGE_COL[4][4] = {
     {200,200,200,255}, //NONE
@@ -240,6 +270,7 @@ static inline Vec3 v3Add(Vec3 a, Vec3 b) { return v3(a.x+b.x, a.y+b.y, a.z+b.z);
 static inline Vec3 v3Sub(Vec3 a, Vec3 b) { return v3(a.x-b.x, a.y-b.y, a.z-b.z); }
 static inline Vec3 v3Scale(Vec3 a, float s) { return v3(a.x*s, a.y*s, a.z*s); }
 static inline Vec3 v3Rand(void) { return v3(frand01()*2-1, frand01()*2-1, frand01()*2-1);}
+static inline Vec3 v3Cross(Vec3 a, Vec3 b) {return v3(a.y*b.z - a.z*b.y, a.z*b.x - a.x*b.z, a.x*b.y - a.y*b.x);}
 static inline float v3Dot(Vec3 a, Vec3 b) { return a.x*b.x + a.y*b.y + a.z*b.z; }
 static inline float v3DotSq(Vec3 a) { return a.x*a.x + a.y*a.y + a.z*a.z; }
 static inline Vec3 v3Normalize(Vec3 a, int sqrtIter, float precision, int failureMode) {
@@ -964,31 +995,6 @@ static inline float latticeRestLen(const Node *a, const Node *b){
     int d2 = v3IntDist2(b->lattice, a->lattice);
     return REST_LEN * sqrtf((float)d2);
 }
-static int findMissingApexCoord(const Body *b, int x, int y, int z, Vec3Int *out) {
-    const Node *A=&b->nodes[x], *B=&b->nodes[y], *C=&b->nodes[z];
-
-    int minx = fmin(A->lattice.x, fmin(B->lattice.x, C->lattice.x)) - 2;
-    int maxx = fmax(A->lattice.x, fmax(B->lattice.x, C->lattice.x)) + 2;
-    int miny = fmin(A->lattice.y, fmin(B->lattice.y, C->lattice.y)) - 2;
-    int maxy = fmax(A->lattice.y, fmax(B->lattice.y, C->lattice.y)) + 2;
-    int minz = fmin(A->lattice.z, fmin(B->lattice.z, C->lattice.z)) - 2;
-    int maxz = fmax(A->lattice.z, fmax(B->lattice.z, C->lattice.z)) + 2;
-
-    for (int ix = minx; ix<=maxx; ++ix) {
-        for (int iy = miny; iy<=maxy; ++iy) {
-            for (int iz = minz; iz<=maxz; ++iz) {
-                if ((ix + iy + iz) &1) continue;
-                Vec3Int coord = v3Int(ix, iy, iz);
-                if (v3IntDist2(coord, A->lattice) != 2) continue;
-                if (v3IntDist2(coord, B->lattice) != 2) continue;
-                if (v3IntDist2(coord, C->lattice) != 2) continue;
-                if (nodeHashGet(b, coord) >= 0) continue;
-                *out=coord; return 1;
-            }
-        }
-    }
-    return 0;
-}
 static void toggleFrontierFace(Body *b, uint16_t x, uint16_t y, uint16_t z, uint16_t inside) {
     if (x==y || y==z || z==x) return;
     uint32_t key = faceKey(x,y,z);
@@ -1015,7 +1021,7 @@ static void toggleFrontierFace(Body *b, uint16_t x, uint16_t y, uint16_t z, uint
     b->faceHashKey[ins] = key;
     b->faceHashVal[ins] = fi;
 }
-static int findOutsideApexCoord_CubicTets(const Body *b, int ia, int ib, int ic, int iInside, Vec3Int *outApex) {
+static int findApexCoord(const Body *b, int ia, int ib, int ic, int iInside, Vec3Int *outApex) {
     Vec3Int A = b->nodes[ia].lattice;
     Vec3Int B = b->nodes[ib].lattice;
     Vec3Int C = b->nodes[ic].lattice;
@@ -1036,7 +1042,6 @@ static int findOutsideApexCoord_CubicTets(const Body *b, int ia, int ib, int ic,
     for (int ox = minx - 1; ox <= minx; ++ox) {
         for (int oy = miny - 1; oy <= miny; ++oy) {
             for (int oz = minz - 1; oz <= minz; ++oz) {
-
                 Vec3Int o = v3Int(ox, oy, oz);
 
                 if (!coordInUnitCube(A, o) || !coordInUnitCube(B, o) || !coordInUnitCube(C, o)) continue;
@@ -1063,7 +1068,7 @@ static int findOutsideApexCoord_CubicTets(const Body *b, int ia, int ib, int ic,
 
                     Vec3Int apex = cornerCoord(o, apexIdx);
 
-                    // Exclude the "inside" tetra apex, if this cube happens to be that one
+                    // Exclude the "inside" tetra apex, if relevant
                     if (apex.x == D.x && apex.y == D.y && apex.z == D.z) continue;
 
                     // If apex already exists in this body, face is not frontier
@@ -1076,16 +1081,6 @@ static int findOutsideApexCoord_CubicTets(const Body *b, int ia, int ib, int ic,
     if (candCount == 0) return 0;
     *outApex = candidates[rand() % candCount];
     return 1;
-}
-static EdgeType pickEdgeType(const Body *b, int a, int c) {
-    float pB = b->genes.boneP, pT = b->genes.tendonP, pM = b->genes.muscleP; //edge type base probabilities
-    //int ba = b->boneDeg[a], bc = b->boneDeg[c]; int be = ba + bc; //neighboring bone edge counts
-    //float XBoneP = b->genes.skeletal * -be; //extra bone probability based on neighboirng bone edges
-
-    float r = frand01();
-    if (r < pB) return EDGE_BONE;
-    if (r < pB + pT) return EDGE_TENDON;
-    return EDGE_MUSCLE;
 }
 static int  addEdge(Body *b, int a, int c, EdgeType type) {
     if (a==c) return 0;
@@ -1114,26 +1109,22 @@ static int  addEdge(Body *b, int a, int c, EdgeType type) {
     b->activeEdgeIdx[b->activeEdgeCount++] = (uint16_t)ei;
     setEdgeType(b, e, type);
     e->restLen = latticeRestLen(&b->nodes[a], &b->nodes[c]);
-    e->muscleTargetMul=0.7f; e->muscleSignal=0.0f;
+    e->muscleTargetMul=0.5f; e->muscleSignal=0.5f;
 
     adjAdd(b, a, c, (uint16_t)ei);
 
     return 1;
 }
-static void randomLinks(Body *b, int extraEdges) {
-    for (int t=0;t<extraEdges;t++) {
-        int a = rand() % b->nodeCount, c = rand() % b->nodeCount;
-        if (!b->nodes[a].alive) continue;
-        int best = -1; float bestScore = -1e30f;
-        for (int tries = 0; tries < 8; ++tries) {
-            int c = rand() % b->nodeCount;
-            if (c == a || !b->nodes[c].alive) continue;
-            float d = v3Dist(b->nodes[a].pos, b->nodes[c].pos);
-            float score = -0.5f * d;
-            if (score > bestScore) {bestScore = score; best = c;}
-        }
-        if (best >= 0) addEdge(b, a, c, pickEdgeType(b, a, c));
-    }
+static void addTetra(Body *b, uint16_t w, uint16_t x, uint16_t y, uint16_t z, uint16_t armatureID) {
+    if (b->tetCount >= MAX_TETS) return;
+
+    Tetra *t = &b->tets[b->tetCount++];
+    t->a = w;
+    t->b = x;
+    t->c = y;
+    t->d = z;
+    t->armatureID = armatureID;
+    t->alive = 1;
 }
 static inline float parentScore(Body *b, int childIdx, int parentIdx) {
     const Genetics *g = &b->genes;
@@ -1145,15 +1136,15 @@ static inline float parentScore(Body *b, int childIdx, int parentIdx) {
 
     return linearity;
 }
-static uint16_t seedNode(Body *b, Vec3Int lattice, NodeType t) {
+static uint16_t seedNode(Body *b, Vec3Int lattice, NodeType t, uint16_t armatureID) {
     if (b->nodeCount >= NODES_PER_BODY) return UINT16_MAX;
-    if (nodeHashGet(b, lattice) > 0) return UINT16_MAX;
+    if (nodeHashGet(b, lattice) >= 0) return UINT16_MAX;
 
     uint16_t i = b->nodeCount++;
     Node *n = &b->nodes[i];
     memset(n, 0, sizeof(*n));
     n->alive  = 1;
-    n->owner = (uint16_t)b->id;
+    n->armatureID = armatureID;
     n->lattice = lattice;
     n->pos = v3Add(b->nodes[0].pos, v3Scale(v3IntTov3(lattice), REST_LEN));
     n->vel = v3(0,0,0); 
@@ -1161,14 +1152,15 @@ static uint16_t seedNode(Body *b, Vec3Int lattice, NodeType t) {
     n->distHeart = 0;
     
     setNodeType(b, &b->nodes[i], t);
-    nodeHashPut(b, n->lattice, i);
+    if (!nodeHashPut(b, n->lattice, i)) {b->nodeCount--; return UINT16_MAX;}
 
     return i;
 }
-static int seedNewBoneonNode(Body *b, uint16_t J) {
+static int seedBoneonNode(Body *b, uint16_t J) {
     if (!b->nodes[J].alive) return 0;
-    if (b->nodeCount + 3 > NODES_PER_BODY) return 0;
-    if (b->adjCount[J] > 3) return 0;
+    if (b->adjCount[J] != 3) return 0;
+    if (b->nodeCount + 2 >= NODES_PER_BODY) return 0;
+    if (b->edgeCount + 11 >= EDGES_PER_BODY) return 0;
 
     uint16_t A = b->adjNode[J][0], B = b->adjNode[J][1], C = b->adjNode[J][2];
     Vec3Int Jc = b->nodes[J].lattice;
@@ -1177,45 +1169,71 @@ static int seedNewBoneonNode(Body *b, uint16_t J) {
     Vec3Int Bp = v3IntSub(v3IntScale(Jc,2), b->nodes[B].lattice);
     Vec3Int Cp = v3IntSub(v3IntScale(Jc,2), b->nodes[C].lattice);
 
-    uint16_t iAp = seedNode(b, Ap, NODE_NORMAL);
-    uint16_t iBp = seedNode(b, Bp, NODE_NORMAL);
-    uint16_t iCp = seedNode(b, Cp, NODE_NORMAL);
+    if (nodeHashGet(b, Ap) >= 0) return 0;
+    if (nodeHashGet(b, Bp) >= 0) return 0;
+    if (nodeHashGet(b, Cp) >= 0) return 0;
+
+    uint16_t armatureID = b->nextArmatureID++;
+
+    uint16_t iAp = seedNode(b, Ap, NODE_NORMAL, armatureID);
+    uint16_t iBp = seedNode(b, Bp, NODE_NORMAL, armatureID);
+    uint16_t iCp = seedNode(b, Cp, NODE_NORMAL, armatureID);
     if (iAp==UINT16_MAX || iBp==UINT16_MAX || iCp==UINT16_MAX) return 0;
 
-    addEdge(b, J,   iAp, EDGE_BONE);
-    addEdge(b, J,   iBp, EDGE_BONE);
-    addEdge(b, J,   iCp, EDGE_BONE);
-    addEdge(b, iAp, iBp, EDGE_BONE);
-    addEdge(b, iBp, iCp, EDGE_BONE);
-    addEdge(b, iCp, iAp, EDGE_BONE);
+    if (!addEdge(b, J,   iAp, EDGE_BONE)) return 0;
+    if (!addEdge(b, J,   iBp, EDGE_BONE)) return 0;
+    if (!addEdge(b, J,   iCp, EDGE_BONE)) return 0;
+    if (!addEdge(b, iAp, iBp, EDGE_BONE)) return 0;
+    if (!addEdge(b, iBp, iCp, EDGE_BONE)) return 0;
+    if (!addEdge(b, iCp, iAp, EDGE_BONE)) return 0;
+
+    addTetra(b, J, iAp, iBp, iCp, b->nodes[iAp].armatureID);
+
+    if (!addEdge(b, iAp, B, EDGE_MUSCLE)) return 0;
+    if (!addEdge(b, iAp, C, EDGE_MUSCLE)) return 0;
+    if (!addEdge(b, iBp, C, EDGE_MUSCLE)) return 0;
+    if (!addEdge(b, iBp, A, EDGE_MUSCLE)) return 0;
+    if (!addEdge(b, iCp, A, EDGE_MUSCLE)) return 0;
+    if (!addEdge(b, iCp, B, EDGE_MUSCLE)) return 0;
 
     toggleFrontierFace(b, iAp, iBp, iCp, J);
 
     return 1;
 }
-static int seedNodeonFace(Body *b, int faceIndex) {
+static int seedNodeonFace(Body *b, int faceIndex, EdgeType type) {
     Face *f = &b->frontier[faceIndex];
     if (!f->alive) return 0;
     if (b->nodeCount >= NODES_PER_BODY) return 0;
+    if (b->edgeCount + 2 >= EDGES_PER_BODY) return 0;
     Vec3Int apex;
-    if (!findOutsideApexCoord_CubicTets(b, f->a, f->b, f->c, f->inside, &apex)){
+    if (!findApexCoord(b, f->a, f->b, f->c, f->inside, &apex)){
         f->alive = 0;
         b->topoDirty = 1;
         return 0;
     }
+    
     toggleFrontierFace(b, f->a, f->b, f->c, f->inside);
 
-    uint16_t ni = seedNode(b, apex, NODE_NORMAL);
+    if (b->adjCount[f->a] >= ADJ_MAX ||
+        b->adjCount[f->b] >= ADJ_MAX ||
+        b->adjCount[f->c] >= ADJ_MAX)
+    {return 0;}
 
-    addEdge(b, ni, f->a, EDGE_BONE /*pickEdgeType(b, ni, f->a)*/);
-    addEdge(b, ni, f->b, EDGE_BONE /*pickEdgeType(b, ni, f->b)*/);
-    addEdge(b, ni, f->c, EDGE_BONE /*pickEdgeType(b, ni, f->c)*/);
+    uint16_t armID = b->nodes[f->a].armatureID;
+    uint16_t ni = seedNode(b, apex, NODE_NORMAL, armID);
+    if (ni == UINT16_MAX) return 0;
+
+    if (!addEdge(b, ni, f->a, type)) return 0;
+    if (!addEdge(b, ni, f->b, type)) return 0;
+    if (!addEdge(b, ni, f->c, type)) return 0;
 
     f->alive = 0;
     toggleFrontierFace(b, f->a, f->b, ni, f->c);
     toggleFrontierFace(b, f->b, f->c, ni, f->a);
     toggleFrontierFace(b, f->c, f->a, ni, f->b);
 
+    addTetra(b, f->a, f->b, f->c, ni, armID);
+    
     jointCandRemove(b, f->a);
     jointCandRemove(b, f->b);
     jointCandRemove(b, f->c);
@@ -1225,24 +1243,82 @@ static int seedNodeonFace(Body *b, int faceIndex) {
     wakeBody(b);
     return 1;
 }
+static void rebuildArmatures(Body *b) {
+    b->armatureCount = 0;
+    for (uint16_t i = 0; i < b->nodeCount; ++i) {
+        if (!b->nodes[i].alive) continue;
+
+        uint16_t id = b->nodes[i].armatureID;
+
+        int armatureIndex = -1;
+
+        for (uint16_t a = 0; a < b->armatureCount; ++a) {
+            if (b->armatures[a].armatureID == id) {
+                armatureIndex = a;
+                break;
+            }
+        }
+
+        if (armatureIndex < 0) {
+            if (b->armatureCount >= MAX_ARMATURES) continue;
+            
+            armatureIndex = b->armatureCount++;
+            b->armatures[armatureIndex].armatureID = id;
+            b->armatures[armatureIndex].nodeCount = 0;
+        }
+
+        Armature *arm = &b->armatures[armatureIndex];
+
+        if (arm->nodeCount < MAX_NODES_PER_ARMATURE) {
+            arm->nodes[arm->nodeCount++] = i;
+        }
+    }
+}
+static void updateArmatureBounds(Body *b) {
+    for (uint16_t a = 0; a < b->armatureCount; ++a) {
+        Armature *arm = &b->armatures[a];
+
+        Vec3 center = v3(0, 0, 0);
+
+        for (uint16_t i = 0; i < arm->nodeCount; ++i) {
+            center = v3Add(center, b->nodes[arm->nodes[i]].pos);
+        }
+
+        center = v3Scale(center, 1.0f / (float)arm->nodeCount);
+        float r2 = 0.0f;
+
+        for (uint16_t i = 0; i < arm->nodeCount; ++i) {
+            Vec3 d = v3Sub(b->nodes[arm->nodes[i]].pos, center);
+            float d2 = v3Dot(d, d);
+            if (d2 > r2) r2 = d2;
+        }
+
+        arm->center = center;
+        arm->radius = sqrtf(r2);
+    }
+}
 static void skeletonLattice(Body *b, Vec3 center) {
     b->edgeCount = 0;
     b->activeEdgeCount = 0;
     b->faceCount = 0;
     b->jointCandCount = 0;
     b->nodeCount = 0;
+    b->armatureCount = 0;
+    b->tetCount = 0;
+    b->nextArmatureID = 2;
 
     
-    seedNode(b, v3Int(0,0,0), NODE_HEART);
+    seedNode(b, v3Int(0,0,0), NODE_HEART, 1);
     b->nodes[0].pos = center;
-    seedNode(b, v3Int(1,0,0), NODE_NORMAL);
-    seedNode(b, v3Int(1,1,0), NODE_NORMAL);
-    seedNode(b, v3Int(1,1,1), NODE_NORMAL);
+    seedNode(b, v3Int(1,0,0), NODE_NORMAL, 1);
+    seedNode(b, v3Int(1,1,0), NODE_NORMAL, 1);
+    seedNode(b, v3Int(1,1,1), NODE_NORMAL, 1);
 
     jointCandAdd(b, 0); jointCandAdd(b, 1); jointCandAdd(b, 2); jointCandAdd(b, 3);
 
     addEdge(b, 0,1, EDGE_BONE); addEdge(b, 0,2, EDGE_BONE); addEdge(b, 0,3, EDGE_BONE); addEdge(b, 1,2, EDGE_BONE); addEdge(b, 1,3, EDGE_BONE); addEdge(b, 2,3, EDGE_BONE);
     toggleFrontierFace(b, 1,2,3, 0); toggleFrontierFace(b, 0,2,3, 1); toggleFrontierFace(b, 0,1,3, 2); toggleFrontierFace(b, 0,1,2, 3);
+    addTetra(b, 0, 1, 2, 3, 1);
 
     if (b->faceCount == 0) {
         computeBoneDegree(b);
@@ -1250,18 +1326,28 @@ static void skeletonLattice(Body *b, Vec3 center) {
     }
 
     while (b->nodeCount < NODES_PER_BODY) {
-            if (rand() % 6 > 0 && b->jointCandCount > 0) {
+            if ((rand() % 6 > 0 && b->jointCandCount > 0) || (b->nextArmatureID > ARMATURES_PER_BODY)) {
             int tries = 0;
             int fi = -1;
             while (tries++ < 64) {
                 int r = rand() % b->faceCount;
                 if (b->frontier[r].alive) {fi = r; break;}
             }
+            if (fi < 0) {
+                for (int i = 0; i < b->faceCount; ++i) {
+                    if (b->frontier[i].alive) {
+                        fi = i;
+                        break;
+                    }
+                }
+            }
             if (fi < 0) break;
-            seedNodeonFace(b, fi);
-        } else {seedNewBoneonNode(b, b->jointCandIdx[rand() % b->jointCandCount]);}
+            seedNodeonFace(b, fi, EDGE_BONE);
+        } else {seedBoneonNode(b, b->jointCandIdx[rand() % b->jointCandCount]);}
     }
     computeBoneDegree(b);
+    rebuildArmatures(b);
+    updateArmatureBounds(b);
 }
 static void generateDNA(Genetics *g) {
     g->linearity = irandRange(1, ADJ_MAX);
@@ -1275,7 +1361,7 @@ static void makeRandomOrganism(int slot, Vec3 center) {
     Body *b = &gBodies[slot];
     Genetics *g = &b->genes;
     b->id = (uint16_t)(slot + 1);
-    b->edgeCount = 0; b->activeEdgeCount = 0;
+    b->edgeCount = 0; b->activeEdgeCount = 0; b->faceCount = 0; b->nodeCount = 0;
     for (int i=0; i<NODES_PER_BODY; ++i) b->adjCount[i] = 0;
     for (int i=0; i<EDGEHASH_CAP; ++i) {
         b->edgeHashKey[i] = EDGEKEY_EMPTY;
@@ -1319,6 +1405,16 @@ static void applyImpulse(Node *n, Vec3 J){
     if (n->invMass <= 0.0f) return;
     n->vel = v3Add(n->vel, v3Scale(J, n->invMass));
 }
+static void moveTetra(Body *b, Tetra *t, Vec3 delta) {
+    uint16_t ids[4] = {t->a, t->b, t->c, t->d};
+
+    for (int i = 0; i < 4; ++i) {
+        Node *n = &b->nodes[ids[i]];
+        if (n->invMass > 0.0f) {
+            n->pos = v3Add(n->pos, delta);
+        }
+    }
+ }
 
 static Vec3 closestPointSeg(Vec3 p, Vec3 a, Vec3 b, float *outT){
     Vec3 ab = v3Sub(b,a);
@@ -1380,6 +1476,63 @@ static void weaponStepAll(Body *self, int wi){
     }
 }
 
+static float signedTetVolume6(Vec3 a, Vec3 b, Vec3 c, Vec3 d) {return v3Dot(v3Cross(v3Sub(b, a), v3Sub(c, a)), v3Sub(d, a));}
+static int pointInsideTetra(Vec3 p, Vec3 a, Vec3 b, Vec3 c, Vec3 d) {
+    float v0 = signedTetVolume6(a, b, c, d);
+    if (fabsf(v0) < 1e-8f) return 0;
+
+    float s0 = signedTetVolume6(p, b, c, d);
+    float s1 = signedTetVolume6(a, p, c, d);
+    float s2 = signedTetVolume6(a, b, p, d);
+    float s3 = signedTetVolume6(a, b, c, p);
+
+    if (v0 < 0.0f) {
+        s0 = -s0;
+        s1 = -s1;
+        s2 = -s2;
+        s3 = -s3;
+        v0 = -v0;
+    }
+
+    const float eps = -1e-5f;
+    return s0 >= eps && s1 >= eps && s2 >= eps && s3 >= eps;
+}
+static int tetraOverlap(Body *b, const Tetra *ta, const Tetra *tb) {
+    uint16_t A[4] = {ta->a, ta->b, ta->c, ta->d};
+    uint16_t B[4] = {tb->a, tb->b, tb->c, tb->d};
+
+    Vec3 ap[4] = {
+        b->nodes[A[0]].pos,
+        b->nodes[A[1]].pos,
+        b->nodes[A[2]].pos,
+        b->nodes[A[3]].pos
+    };
+
+    Vec3 bp[4] = {
+        b->nodes[B[0]].pos,
+        b->nodes[B[1]].pos,
+        b->nodes[B[2]].pos,
+        b->nodes[B[3]].pos
+    };
+
+    for (int i = 0; i < 4; ++i) {
+        if (pointInsideTetra(ap[i], bp[0], bp[1], bp[2], bp[3])) return 1;
+        if (pointInsideTetra(bp[i], ap[0], ap[1], ap[2], ap[3])) return 1;
+    }
+
+    return 0;
+}
+static Vec3 tetraCenter(Body *b, Tetra *t) {
+    Vec3 p = v3(0, 0, 0);
+
+    p = v3Add(p, b->nodes[t->a].pos);
+    p = v3Add(p, b->nodes[t->b].pos);
+    p = v3Add(p, b->nodes[t->c].pos);
+    p = v3Add(p, b->nodes[t->d].pos);
+
+    return v3Scale(p, 0.25f);
+}
+
 static void clearForces(Node* n, int count) {
     for (int i = 0; i < count; ++i) v3Zero(&n[i].force);
 }
@@ -1405,10 +1558,28 @@ static void applySpring(Node* a, Node* b, float rest, float k, float damp) {
 static void applyAllSprings(Body *b) {
     for (uint16_t i=0; i<b->activeEdgeCount; ++i) {
         Edge *e = &b->edges[b->activeEdgeIdx[i]];
+        float rest = e->restLen;
         if (e->type == EDGE_BONE) continue;
-        applySpring(&b->nodes[e->a], &b->nodes[e->b], e->restLen, e->k, e->damping);
+        if (e->type == EDGE_MUSCLE) {float s = CLAMP01(e->muscleSignal); rest *= 1.0f - s * (1.0f - e->muscleTargetMul);}
+        applySpring(&b->nodes[e->a], &b->nodes[e->b], rest, e->k, e->damping);
     }
 }
+static void updateMuscleSignals(Body *b) {
+    const float freq = 0.175f; // cycles per second
+    const float omega = 2.0f * PI * freq;
+
+    for (uint16_t i = 0; i < b->activeEdgeCount; ++i) {
+        Edge *e = &b->edges[b->activeEdgeIdx[i]];
+        if (e->type != EDGE_MUSCLE) continue;
+
+        // Slight phase offset so all muscles do not fire identically.
+        float phase = 0.73f * (float)i;
+
+        // Signal ranges from 0 to 1.
+        e->muscleSignal = 0.5f + 0.5f * sinf(omega * gSimTime + phase);
+    }
+}
+
 static void resolveBounds(Node *n) {
     const float bounce = 0.8f;
 
@@ -1447,6 +1618,62 @@ static void integrate(Node* n, int count, float dt, const uint8_t *boneDeg) {
         resolveBounds(&n[i]);
     }
 }
+static void solveArmatureCollisions(Body *b) {
+    updateArmatureBounds(b);
+    for (uint16_t i = 0; i < b->armatureCount; ++i) {
+        Armature *a = &b->armatures[i];
+
+        for (uint16_t j = i + 1; j < b->armatureCount; ++j) {
+            Armature *c = &b->armatures[j];
+
+            Vec3 d = v3Sub(a->center, c->center);
+            float dist2 = v3DotSq(d);
+
+            float minDist = a->radius + c->radius;
+            float minDist2 = minDist * minDist;
+
+            if (dist2 >= minDist2) continue;
+            if (dist2 < 0.0001f) continue;
+            
+            Tetra *hitA = NULL;
+            Tetra *hitB = NULL;
+
+            for (uint16_t ti = 0; ti < b->tetCount && hitA == NULL; ++ti) {
+                Tetra *ta = &b->tets[ti];
+                if (!ta->alive) continue;
+                if (ta->armatureID != a->armatureID) continue;
+
+                for (uint16_t tj = 0; tj < b->tetCount; ++tj) {
+                    Tetra *tb = &b->tets[tj];
+                    if (!tb->alive) continue;
+                    if (tb->armatureID != c->armatureID) continue;
+
+                    if (tetraOverlap(b, ta, tb)) {
+                        hitA = ta;
+                        hitB = tb;
+                        break;
+                    }
+                }
+            }
+            if (hitA == NULL || hitB == NULL) continue;
+
+            Vec3 ca = tetraCenter(b, hitA);
+            Vec3 cb = tetraCenter(b, hitB);
+            Vec3 td = v3Sub(ca, cb);
+            float tdist2 = v3DotSq(td);
+            if (tdist2 < 0.000001f) continue;
+            float tdist = sqrtf(tdist2);
+            
+            Vec3 n = v3Scale(td, 1.0f / tdist);
+
+            float correction = REST_LEN * 0.05f;
+            Vec3 delta = v3Scale(n, correction);
+            moveTetra(b, hitA, delta);
+            moveTetra(b, hitB, v3Scale(delta, -1.0f));
+        }
+    }
+}
+
 static void physicsTickBody(Body *b, float dt) {
     if (b->sleeping) return;
 
@@ -1454,13 +1681,16 @@ static void physicsTickBody(Body *b, float dt) {
     for (int i = 0; i < b->nodeCount; ++i) oldPos[i] = b->nodes[i].pos;
 
     clearForces(b->nodes, b->nodeCount);
+    //updateMuscleSignals(b);
     applyAllSprings(b);
     integrate(b->nodes, b->nodeCount, dt, b->boneDeg);
 
     solveBones(b);
+    solveArmatureCollisions(b);
+    solveBones(b);
     updateVelFromPos(b->nodes, oldPos, b->nodeCount, dt);
 
-    if (bodyIsQuiet(b)) {
+    if (0 && bodyIsQuiet(b)) {
         b->sleepFrames++;
         if (b->sleepFrames >= SLEEP_FRAMES) {
             b->sleeping = 1;
@@ -1504,7 +1734,7 @@ static int handleInput (Camera *cam) {
             cam->yaw     -= e.motion.xrel * 0.01f;
             cam->pitch   -= e.motion.yrel * 0.01f;
         } else if (e.type == SDL_MOUSEWHEEL) {
-            cam->focal = CLAMP(cam->focal * ((e.wheel.y>0)? 0.95f : (e.wheel.y<0)? 1.05f : 1.0f), 1.0f, 30.0f);
+            cam->focal = CLAMP(cam->focal * ((e.wheel.y>0)? 0.95f : (e.wheel.y<0)? 1.05f : 1.0f), 1.0f, 100.0f);
         }
         else if (e.type == SDL_KEYDOWN) {
             if (e.key.keysym.sym == SDLK_ESCAPE) return 0;
@@ -1544,6 +1774,7 @@ int main(int argc, char **argv) {
         if (!handleInput(&cam)) running = 0;
         Uint64 now = SDL_GetPerformanceCounter();
         float dt = CLAMP((now - prev) / freq, 0.0f, 0.05f);
+        gSimTime += dt;
         prev = now;
 
         for (int i=0; i<gBodyCount; ++i) {
@@ -1584,12 +1815,12 @@ int main(int argc, char **argv) {
 }
 
 /* TO DO
-    force generation of tendons around joints; increase spring strength significantly, hopefully enough to prevent inverting
-    Tag joints and check for collision solving every so often
+    Fix collisions
     add bone formation vs bone growth probabilities to DNA and impliment
-    reenable muscle generation
+    transition to live growth instead of instant on bootup to spread out processing load and support future reproductive behaviors
     add ambient sensory inputs such as proximity to nodes of interest to allow future implimentation of basic behaviors
     add food and hunger stimulation for a simple goal; possibly force seperated nodes to become bodyless food nodes instead of vanishing
     complete generateDNA and impliment genetics for greater diversity and an evolutionary and reproductive basis
     add a reproductive node to allow for the introduction of evolutionary behaviors
+    Divide and label code
 */
