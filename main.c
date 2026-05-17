@@ -27,9 +27,8 @@
 #define MAX_EDGES               2048
 #define MAX_FACES               2048
 #define MAX_ARMATURES           512
-#define MAX_TETS                2048
-#define ARMATURES_PER_BODY      2
-#define NODES_PER_BODY          100
+#define ARMATURES_PER_BODY      5
+#define NODES_PER_BODY          50
 #define ADJ_MAX                 14
 #define EDGES_PER_BODY          (6 * NODES_PER_BODY + 2 * NODES_PER_BODY)
 #define MAX_NODES_PER_ARMATURE  64
@@ -63,6 +62,8 @@ static const int8_t OFFS[12][3] = {
 #define DISC_SEG            24
 #define MAX_DRAW_EDGES      (MAX_BODIES * EDGES_PER_BODY)
 #define MAX_DRAW_NODES      (MAX_BODIES * NODES_PER_BODY)
+
+#define PHYSICS_STEPS       8
 
 static int gBodyCount = 0;
 
@@ -154,12 +155,6 @@ typedef struct {
 } Armature;
 
 typedef struct {
-    uint16_t a, b, c, d;
-    uint16_t armatureID;
-    uint16_t alive;
-} Tetra;
-
-typedef struct {
     Node nodes[NODES_PER_BODY]; 
     int nodeCount;
     Edge edges[EDGES_PER_BODY]; 
@@ -187,9 +182,6 @@ typedef struct {
 
     Armature armatures[MAX_ARMATURES];
     uint16_t armatureCount;
-
-    Tetra tets[MAX_TETS];
-    uint16_t tetCount;
 
     uint16_t id;
 
@@ -1115,17 +1107,6 @@ static int  addEdge(Body *b, int a, int c, EdgeType type) {
 
     return 1;
 }
-static void addTetra(Body *b, uint16_t w, uint16_t x, uint16_t y, uint16_t z, uint16_t armatureID) {
-    if (b->tetCount >= MAX_TETS) return;
-
-    Tetra *t = &b->tets[b->tetCount++];
-    t->a = w;
-    t->b = x;
-    t->c = y;
-    t->d = z;
-    t->armatureID = armatureID;
-    t->alive = 1;
-}
 static inline float parentScore(Body *b, int childIdx, int parentIdx) {
     const Genetics *g = &b->genes;
     const Node *child = &b->nodes[childIdx];
@@ -1186,16 +1167,14 @@ static int seedBoneonNode(Body *b, uint16_t J) {
     if (!addEdge(b, iAp, iBp, EDGE_BONE)) return 0;
     if (!addEdge(b, iBp, iCp, EDGE_BONE)) return 0;
     if (!addEdge(b, iCp, iAp, EDGE_BONE)) return 0;
-
-    addTetra(b, J, iAp, iBp, iCp, b->nodes[iAp].armatureID);
-
+    
     if (!addEdge(b, iAp, B, EDGE_MUSCLE)) return 0;
     if (!addEdge(b, iAp, C, EDGE_MUSCLE)) return 0;
     if (!addEdge(b, iBp, C, EDGE_MUSCLE)) return 0;
     if (!addEdge(b, iBp, A, EDGE_MUSCLE)) return 0;
     if (!addEdge(b, iCp, A, EDGE_MUSCLE)) return 0;
     if (!addEdge(b, iCp, B, EDGE_MUSCLE)) return 0;
-
+    
     toggleFrontierFace(b, iAp, iBp, iCp, J);
 
     return 1;
@@ -1231,8 +1210,6 @@ static int seedNodeonFace(Body *b, int faceIndex, EdgeType type) {
     toggleFrontierFace(b, f->a, f->b, ni, f->c);
     toggleFrontierFace(b, f->b, f->c, ni, f->a);
     toggleFrontierFace(b, f->c, f->a, ni, f->b);
-
-    addTetra(b, f->a, f->b, f->c, ni, armID);
     
     jointCandRemove(b, f->a);
     jointCandRemove(b, f->b);
@@ -1289,7 +1266,8 @@ static void updateArmatureBounds(Body *b) {
 
         for (uint16_t i = 0; i < arm->nodeCount; ++i) {
             Vec3 d = v3Sub(b->nodes[arm->nodes[i]].pos, center);
-            float d2 = v3Dot(d, d);
+            float dLen = v3Len(d) + b->nodes[arm->nodes[i]].radius;
+            float d2 = dLen * dLen;
             if (d2 > r2) r2 = d2;
         }
 
@@ -1304,7 +1282,6 @@ static void skeletonLattice(Body *b, Vec3 center) {
     b->jointCandCount = 0;
     b->nodeCount = 0;
     b->armatureCount = 0;
-    b->tetCount = 0;
     b->nextArmatureID = 2;
 
     
@@ -1318,7 +1295,6 @@ static void skeletonLattice(Body *b, Vec3 center) {
 
     addEdge(b, 0,1, EDGE_BONE); addEdge(b, 0,2, EDGE_BONE); addEdge(b, 0,3, EDGE_BONE); addEdge(b, 1,2, EDGE_BONE); addEdge(b, 1,3, EDGE_BONE); addEdge(b, 2,3, EDGE_BONE);
     toggleFrontierFace(b, 1,2,3, 0); toggleFrontierFace(b, 0,2,3, 1); toggleFrontierFace(b, 0,1,3, 2); toggleFrontierFace(b, 0,1,2, 3);
-    addTetra(b, 0, 1, 2, 3, 1);
 
     if (b->faceCount == 0) {
         computeBoneDegree(b);
@@ -1405,17 +1381,6 @@ static void applyImpulse(Node *n, Vec3 J){
     if (n->invMass <= 0.0f) return;
     n->vel = v3Add(n->vel, v3Scale(J, n->invMass));
 }
-static void moveTetra(Body *b, Tetra *t, Vec3 delta) {
-    uint16_t ids[4] = {t->a, t->b, t->c, t->d};
-
-    for (int i = 0; i < 4; ++i) {
-        Node *n = &b->nodes[ids[i]];
-        if (n->invMass > 0.0f) {
-            n->pos = v3Add(n->pos, delta);
-        }
-    }
- }
-
 static Vec3 closestPointSeg(Vec3 p, Vec3 a, Vec3 b, float *outT){
     Vec3 ab = v3Sub(b,a);
     float t = CLAMP01(v3Dot(v3Sub(p,a), ab) / (v3DotSq(ab) + 1e-8f));
@@ -1476,63 +1441,6 @@ static void weaponStepAll(Body *self, int wi){
     }
 }
 
-static float signedTetVolume6(Vec3 a, Vec3 b, Vec3 c, Vec3 d) {return v3Dot(v3Cross(v3Sub(b, a), v3Sub(c, a)), v3Sub(d, a));}
-static int pointInsideTetra(Vec3 p, Vec3 a, Vec3 b, Vec3 c, Vec3 d) {
-    float v0 = signedTetVolume6(a, b, c, d);
-    if (fabsf(v0) < 1e-8f) return 0;
-
-    float s0 = signedTetVolume6(p, b, c, d);
-    float s1 = signedTetVolume6(a, p, c, d);
-    float s2 = signedTetVolume6(a, b, p, d);
-    float s3 = signedTetVolume6(a, b, c, p);
-
-    if (v0 < 0.0f) {
-        s0 = -s0;
-        s1 = -s1;
-        s2 = -s2;
-        s3 = -s3;
-        v0 = -v0;
-    }
-
-    const float eps = -1e-5f;
-    return s0 >= eps && s1 >= eps && s2 >= eps && s3 >= eps;
-}
-static int tetraOverlap(Body *b, const Tetra *ta, const Tetra *tb) {
-    uint16_t A[4] = {ta->a, ta->b, ta->c, ta->d};
-    uint16_t B[4] = {tb->a, tb->b, tb->c, tb->d};
-
-    Vec3 ap[4] = {
-        b->nodes[A[0]].pos,
-        b->nodes[A[1]].pos,
-        b->nodes[A[2]].pos,
-        b->nodes[A[3]].pos
-    };
-
-    Vec3 bp[4] = {
-        b->nodes[B[0]].pos,
-        b->nodes[B[1]].pos,
-        b->nodes[B[2]].pos,
-        b->nodes[B[3]].pos
-    };
-
-    for (int i = 0; i < 4; ++i) {
-        if (pointInsideTetra(ap[i], bp[0], bp[1], bp[2], bp[3])) return 1;
-        if (pointInsideTetra(bp[i], ap[0], ap[1], ap[2], ap[3])) return 1;
-    }
-
-    return 0;
-}
-static Vec3 tetraCenter(Body *b, Tetra *t) {
-    Vec3 p = v3(0, 0, 0);
-
-    p = v3Add(p, b->nodes[t->a].pos);
-    p = v3Add(p, b->nodes[t->b].pos);
-    p = v3Add(p, b->nodes[t->c].pos);
-    p = v3Add(p, b->nodes[t->d].pos);
-
-    return v3Scale(p, 0.25f);
-}
-
 static void clearForces(Node* n, int count) {
     for (int i = 0; i < count; ++i) v3Zero(&n[i].force);
 }
@@ -1554,6 +1462,28 @@ static void applySpring(Node* a, Node* b, float rest, float k, float damp) {
     pos = v3Scale(pos, f);
     a->force = v3Add(a->force, pos);
     b->force = v3Sub(b->force, pos);
+}
+static void applyRepulsion(Node *a, Node *b, Vec3 normal, float dist, float range, float k, float damp) {
+    if (dist >=range) return;
+
+    float wsum = a->invMass + b->invMass;
+    if (wsum <= 0.0f) return;
+
+    float x = CLAMP01(1.0f - dist / range);
+    float fRepel = k * x * x;
+
+    Vec3 relVel = v3Sub(b->vel, a->vel);
+    float vn = v3Dot(relVel, normal);
+
+    float fDamp = 0.0f;
+    if (vn < 0.0f) {
+        fDamp = -damp * vn * x * x;
+    }
+
+    Vec3 f = v3Scale(normal, fRepel + fDamp);
+
+    a->force = v3Sub(a->force, f);
+    b->force = v3Add(b->force, f);
 }
 static void applyAllSprings(Body *b) {
     for (uint16_t i=0; i<b->activeEdgeCount; ++i) {
@@ -1618,76 +1548,55 @@ static void integrate(Node* n, int count, float dt, const uint8_t *boneDeg) {
         resolveBounds(&n[i]);
     }
 }
-static void solveArmatureCollisions(Body *b) {
-    updateArmatureBounds(b);
+static void applyNodeRepulsions(Body *b) {
+    const float range = REST_LEN * 0.5f;
+    const float k = 800.0f;
+    const float damp = 8.0f;
+
     for (uint16_t i = 0; i < b->armatureCount; ++i) {
         Armature *a = &b->armatures[i];
-
         for (uint16_t j = i + 1; j < b->armatureCount; ++j) {
             Armature *c = &b->armatures[j];
-
-            Vec3 d = v3Sub(a->center, c->center);
-            float dist2 = v3DotSq(d);
-
-            float minDist = a->radius + c->radius;
-            float minDist2 = minDist * minDist;
-
-            if (dist2 >= minDist2) continue;
-            if (dist2 < 0.0001f) continue;
             
-            Tetra *hitA = NULL;
-            Tetra *hitB = NULL;
+            Vec3 d = v3Sub(c->center, a->center);
+            float maxDist = a->radius + c->radius + range;
+            if (v3DotSq(d) > maxDist * maxDist) continue;
 
-            for (uint16_t ti = 0; ti < b->tetCount && hitA == NULL; ++ti) {
-                Tetra *ta = &b->tets[ti];
-                if (!ta->alive) continue;
-                if (ta->armatureID != a->armatureID) continue;
+            for (uint16_t ni = 0; ni < a->nodeCount; ++ni) {
+                Node *na = &b->nodes[a->nodes[ni]];
+                for (uint16_t nj = 0; nj < c->nodeCount; ++nj) {
+                    Node *nb = &b->nodes[c->nodes[nj]];
 
-                for (uint16_t tj = 0; tj < b->tetCount; ++tj) {
-                    Tetra *tb = &b->tets[tj];
-                    if (!tb->alive) continue;
-                    if (tb->armatureID != c->armatureID) continue;
+                    Vec3 diff = v3Sub(nb->pos, na->pos);
+                    float d2 = v3DotSq(diff);
+                    if (d2 < 1e-8f) continue;
 
-                    if (tetraOverlap(b, ta, tb)) {
-                        hitA = ta;
-                        hitB = tb;
-                        break;
-                    }
+                    float dist = sqrtf(d2);
+                    float effectiveRange = range + na->radius + nb->radius;
+                    if (dist >= effectiveRange) continue;
+
+                    Vec3 n = v3Scale(diff, 1.0f / dist);
+                    applyRepulsion(na, nb, n, dist, effectiveRange, k, damp);
                 }
             }
-            if (hitA == NULL || hitB == NULL) continue;
-
-            Vec3 ca = tetraCenter(b, hitA);
-            Vec3 cb = tetraCenter(b, hitB);
-            Vec3 td = v3Sub(ca, cb);
-            float tdist2 = v3DotSq(td);
-            if (tdist2 < 0.000001f) continue;
-            float tdist = sqrtf(tdist2);
-            
-            Vec3 n = v3Scale(td, 1.0f / tdist);
-
-            float correction = REST_LEN * 0.05f;
-            Vec3 delta = v3Scale(n, correction);
-            moveTetra(b, hitA, delta);
-            moveTetra(b, hitB, v3Scale(delta, -1.0f));
         }
     }
 }
-
 static void physicsTickBody(Body *b, float dt) {
     if (b->sleeping) return;
 
     Vec3 oldPos[NODES_PER_BODY];
     for (int i = 0; i < b->nodeCount; ++i) oldPos[i] = b->nodes[i].pos;
 
-    clearForces(b->nodes, b->nodeCount);
-    //updateMuscleSignals(b);
-    applyAllSprings(b);
-    integrate(b->nodes, b->nodeCount, dt, b->boneDeg);
+    for (int s = 0; s < PHYSICS_STEPS; ++s) {
+        clearForces(b->nodes, b->nodeCount);
+        //updateMuscleSignals(b);
+        applyAllSprings(b);
+        applyNodeRepulsions(b);
+        integrate(b->nodes, b->nodeCount, dt / PHYSICS_STEPS, b->boneDeg);
 
-    solveBones(b);
-    solveArmatureCollisions(b);
-    solveBones(b);
+        solveBones(b);
+    }
     updateVelFromPos(b->nodes, oldPos, b->nodeCount, dt);
 
     if (0 && bodyIsQuiet(b)) {
@@ -1815,7 +1724,8 @@ int main(int argc, char **argv) {
 }
 
 /* TO DO
-    Fix collisions
+    Redesign skeleton generation to be constraint-driven
+    Impliment links between adjacent armatures to minimalize collision reliance
     add bone formation vs bone growth probabilities to DNA and impliment
     transition to live growth instead of instant on bootup to spread out processing load and support future reproductive behaviors
     add ambient sensory inputs such as proximity to nodes of interest to allow future implimentation of basic behaviors
