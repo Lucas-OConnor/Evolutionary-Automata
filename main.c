@@ -25,13 +25,12 @@
 #define MAX_NODES               1024
 #define MAX_BODIES              40
 #define MAX_EDGES               2048
-#define MAX_FACES               2048
 #define MAX_ARMATURES           512
 #define ARMATURES_PER_BODY      5
 #define NODES_PER_BODY          50
 #define ADJ_MAX                 14
 #define EDGES_PER_BODY          (6 * NODES_PER_BODY + 2 * NODES_PER_BODY)
-#define MAX_NODES_PER_ARMATURE  64
+#define NODES_PER_ARMATURE      64
 
 
 #define EDGEKEY_EMPTY   0xFFFFFFFFu
@@ -44,11 +43,6 @@
 #define NODEHASH_CAP    512
 #define NODEHASH_MASK   (NODEHASH_CAP -1)
 
-#define FACEKEY_EMPTY   0xFFFFFFFFu
-#define FACEKEY_TOMB    0xFFFFFFFEu
-#define FACEHASH_CAP    2048
-#define FACEHASH_MASK   (FACEHASH_CAP - 1)
-
 static const int8_t OFFS[12][3] = {
     {+1,+1, 0}, {+1,-1, 0}, {-1,+1, 0}, {-1,-1, 0},
     {+1, 0,+1}, {+1, 0,-1}, {-1, 0,+1}, {-1, 0,-1},
@@ -56,6 +50,8 @@ static const int8_t OFFS[12][3] = {
 };
 
 #define REST_LEN            0.5f
+#define TENDON_SNAP_MUL     1.5f
+#define FASCIA_SNAP_MUL     2.0f
 
 #define MAX_PARTICLES       4096
 
@@ -69,10 +65,13 @@ static int gBodyCount = 0;
 
 typedef struct { float x, y, z; } Vec3;
 typedef struct { int x, y, z; } Vec3Int;
+typedef struct { float w, x, y, z;} Quat;
+typedef struct { float m[3][3]; } Mat3;
 
 typedef enum {
     EDGE_NONE   = 0,
     EDGE_TENDON,
+    EDGE_FASCIA,
     EDGE_BONE,
     EDGE_MUSCLE
 } EdgeType;
@@ -108,15 +107,13 @@ typedef struct {
 
 typedef struct {
     Vec3  pos;              // 3D position (simulation space)
-    Vec3  vel;              // 3D velocity
-    Vec3  force;            // accumulator each tick
-    float invMass;          // 0 = fixed, else 1/mass
-    uint16_t armatureID;    // skeletal rigidbody ID
+    float mass;             
+    uint16_t armatureIDA;   // skeletal parent rigidbody ID
+    uint16_t armatureIDB;   // skeletal child rigidbody ID
     NodeType type;
     float radius;
     uint8_t alive;
     uint8_t distHeart;      // number of nodes in the shortest path to the heart node (heart is 1, disconnected is 0)
-    Vec3Int lattice;        // skeleton lattice coordinates
 } Node;
 static float    gNodePos_Type[3][MAX_DRAW_NODES * 18];
 static float    gNodeUV[MAX_DRAW_NODES * 12];
@@ -140,17 +137,18 @@ static float    gEdgePos_Type[4][MAX_DRAW_EDGES * 18];
 static int      gEdgeCount_Type[4];
 
 typedef struct {
-    uint16_t    a, b, c;
-    uint16_t    inside;
-    uint8_t     alive;
-} Face;
-
-typedef struct {
     uint16_t armatureID;
     uint16_t nodeCount;
-    uint16_t nodes[MAX_NODES_PER_ARMATURE];
+    uint16_t nodes[NODES_PER_ARMATURE];
+    Vec3 localPos[NODES_PER_ARMATURE];
+    uint16_t nodeLocalID[NODES_PER_BODY];
 
-    Vec3 center;
+    Vec3 pos, vel, force;
+    Quat rot;
+    Vec3 angVel, torque;
+    float mass, invMass;
+    Mat3 invInertiaLocal;
+
     float radius;
 } Armature;
 
@@ -161,8 +159,6 @@ typedef struct {
     int edgeCount;
     uint16_t activeEdgeIdx[EDGES_PER_BODY];
     uint16_t activeEdgeCount;
-    Face frontier[MAX_FACES];
-    int faceCount;
     uint8_t adjCount[NODES_PER_BODY];
     uint16_t adjNode[NODES_PER_BODY][ADJ_MAX];
     uint16_t adjEdge[NODES_PER_BODY][ADJ_MAX];
@@ -172,9 +168,6 @@ typedef struct {
 
     uint32_t nodeHashKey[NODEHASH_CAP];
     uint32_t nodeHashVal[NODEHASH_CAP];
-
-    uint32_t faceHashKey[FACEHASH_CAP];
-    uint16_t faceHashVal[FACEHASH_CAP];
 
     uint16_t jointCandIdx[NODES_PER_BODY];
     uint16_t jointCandCount;
@@ -189,7 +182,6 @@ typedef struct {
     uint8_t sleeping;
 
     uint8_t topoDirty;
-    uint8_t boneDeg[NODES_PER_BODY];
 
     uint16_t nextArmatureID;
 
@@ -217,9 +209,10 @@ static float gProjKy = 1.0f;
 
 static float gSimTime = 0.0f;
 
-static const uint8_t EDGE_COL[4][4] = {
+static const uint8_t EDGE_COL[5][4] = {
     {200,200,200,255}, //NONE
     {120,200,255,255}, //TENDON
+    {200,110, 85,225}, //FASCIA
     {230,230,210,255}, //BONE
     {255,120,120,255}, //MUSCLE
 };
@@ -230,9 +223,10 @@ static const uint8_t NODE_COL[3][4] = {
     {255,200, 50,255}, //WEAPON
 };
 
-static const HitFX FX_ON_BREAK[4] = {
+static const HitFX FX_ON_BREAK[5] = {
     {255,255,255,255,  0, 0.0f}, //NONE
     {120,200,255,255, 18, 0.0f}, //TENDON
+    {200,110, 85,225, 15, 0.0f}, //FASCIA
     {230,230,210,255, 30, 0.6f}, //BONE
     {255,120,120,255, 22, 0.0f}, //MUSCLE
 };
@@ -261,6 +255,7 @@ static inline Vec3 v3(float x, float y, float z) { Vec3 v = {x,y,z}; return v; }
 static inline Vec3 v3Add(Vec3 a, Vec3 b) { return v3(a.x+b.x, a.y+b.y, a.z+b.z); }
 static inline Vec3 v3Sub(Vec3 a, Vec3 b) { return v3(a.x-b.x, a.y-b.y, a.z-b.z); }
 static inline Vec3 v3Scale(Vec3 a, float s) { return v3(a.x*s, a.y*s, a.z*s); }
+static inline Vec3 v3Average(Vec3 a, Vec3 b) { return v3((a.x+b.x)/2, (a.y+b.y)/2, (a.z+b.z)/2); }
 static inline Vec3 v3Rand(void) { return v3(frand01()*2-1, frand01()*2-1, frand01()*2-1);}
 static inline Vec3 v3Cross(Vec3 a, Vec3 b) {return v3(a.y*b.z - a.z*b.y, a.z*b.x - a.x*b.z, a.x*b.y - a.y*b.x);}
 static inline float v3Dot(Vec3 a, Vec3 b) { return a.x*b.x + a.y*b.y + a.z*b.z; }
@@ -287,6 +282,88 @@ static inline Vec3Int v3IntScale(Vec3Int a, int b) {return v3Int(a.x*b, a.y*b, a
 static inline int v3IntDotSq(Vec3Int a) {return (int)a.x*a.x + (int)a.y*a.y + (int)a.z*a.z;}
 static inline int v3IntDist2(Vec3Int a, Vec3Int b) { return v3IntDotSq(v3Int(b.x-a.x, b.y-a.y, b.z-a.z));}
 static inline Vec3 v3IntTov3(Vec3Int a) {return v3((float)a.x, (float)a.y, (float)a.z);}
+
+static inline Quat quatIdentity(void) {return ((Quat){1, 0, 0, 0});}
+static inline Quat quatMul(Quat a, Quat b) {
+    Quat q;
+
+    q.w = a.w*b.w - a.x*b.x - a.y*b.y - a.z*b.z;
+    q.x = a.w*b.x + a.x*b.w + a.y*b.z - a.z*b.y;
+    q.y = a.w*b.y - a.x*b.z + a.y*b.w + a.z*b.x;
+    q.z = a.w*b.z + a.x*b.y - a.y*b.x + a.z*b.w;
+
+    return q;
+}
+static inline Quat quatConjugate(Quat q) {
+    Quat r = {q.w, -q.x, -q.y, -q.z};
+    return r;
+}
+static inline float quatDot(Quat q) {return (q.w*q.w + q.x*q.x + q.y*q.y + q.z*q.z);}
+static inline Quat quatNormalize(Quat q) {
+    float invLen = invSqrt(quatDot(q), 1);
+    q.w *= invLen;
+    q.x *= invLen;
+    q.y *= invLen;
+    q.z *= invLen;
+    return q;
+}
+static inline Vec3 quatRotate(Quat q, Vec3 v) {
+    Quat p = {0, v.x, v.y, v.z};
+    Quat qc = quatConjugate(q);
+    Quat t = quatMul(quatMul(q, p), qc);
+    return v3(t.x, t.y, t.z);
+}
+
+static Mat3 mat3Zero(void) {return (Mat3){0};}
+static Mat3 mat3Identity(void) {
+    Mat3 r = {0};
+    r.m[0][0] = 1.0f;
+    r.m[1][1] = 1.0f;
+    r.m[2][2] = 1.0f;
+    return r;
+}
+static Vec3 mat3MulVec3(Mat3 m, Vec3 v) {
+    return v3(
+        m.m[0][0]*v.x + m.m[0][1]*v.y + m.m[0][2]*v.z,
+        m.m[1][0]*v.x + m.m[1][1]*v.y + m.m[1][2]*v.z,
+        m.m[2][0]*v.x + m.m[2][1]*v.y + m.m[2][2]*v.z
+    );
+}
+static inline Mat3 mat3Inverse(Mat3 A) {
+    Mat3 r = {0};
+
+    float a = A.m[0][0], b = A.m[0][1], c = A.m[0][2];
+    float d = A.m[1][0], e = A.m[1][1], f = A.m[1][2];
+    float g = A.m[2][0], h = A.m[2][1], i = A.m[2][2];
+
+    float Aco = (e*i - f*h);
+    float Bco = -(d*i - f*g);
+    float Cco = (d*h - e*g);
+    float Dco = -(b*i - c*h);
+    float Eco = (a*i - c*g);
+    float Fco = -(a*h - b*g);
+    float Gco = (b*f - c*e);
+    float Hco = -(a*f - c*d);
+    float Ico = (a*e - b*d);
+
+    float det = a*Aco + b*Bco + c*Cco;
+
+    if (fabsf(det) < 1e-8f) {return(mat3Identity());}
+
+    float invDet = 1.0f / det;
+
+    r.m[0][0] = Aco * invDet;
+    r.m[0][1] = Dco * invDet;
+    r.m[0][2] = Gco * invDet;
+    r.m[1][0] = Bco * invDet;
+    r.m[1][1] = Eco * invDet;
+    r.m[1][2] = Hco * invDet;
+    r.m[2][0] = Cco * invDet;
+    r.m[2][1] = Fco * invDet;
+    r.m[2][2] = Ico * invDet;
+
+    return r;
+}
 
 
 #define CLAMP(v, l, h) ((v) < (l) ? (l) : ((v) > (h) ? (h) : (v)))
@@ -321,17 +398,12 @@ static inline void sort3u16(uint16_t *a, uint16_t *b, uint16_t *c) {
     if (x>y) {t=x;x=y;y=t;}
     *a=x;*b=y;*c=z;
 }
-static inline uint32_t faceKey(uint16_t a, uint16_t b, uint16_t c) {
-    sort3u16(&a,&b,&c);
-    return ((uint32_t)a <<20) | ((uint32_t)b << 10) | (uint32_t)c;
-}
-static inline uint32_t faceHash0(uint32_t key){ return hash32(key) & FACEHASH_MASK;}
 
 static inline void wakeBody(Body *b) { b->sleeping = 0; b->sleepFrames = 0; }
 static int  bodyIsQuiet(const Body *b) {
     float maxV2 = 0.0f;
-    for (int i = 0; i < b->nodeCount; ++i) {
-        Vec3 v = b->nodes[i].vel;
+    for (int i = 0; i < b->armatureCount; ++i) {
+        Vec3 v = b->armatures[i].vel;
         float v2 = sqr(v.x) + sqr(v.y) + sqr(v.z);
         if (v2 > maxV2) maxV2 = v2;
     }
@@ -352,7 +424,7 @@ static void bodyBounds(Body *b) {
         }
     }
     if (!foundLive) {b->bsRadius = 0.0f; b->bsCenter = v3(0,0,0); b->bbMin = v3(0,0,0); b->bbMax = v3(0,0,0); return;}
-    b->bsCenter = v3Scale(v3Add(min, max), 0.5);
+    b->bsCenter = v3Average(min, max);
     b->bbMin = min;
     b->bbMax = max;
     float rMax = 0.0f;
@@ -487,6 +559,7 @@ static void drawNodes(const Camera *cam) {
             gNodeCountType[t]++;        //iterate node count
         }
     }
+    
     glEnable(GL_DEPTH_TEST);
     glDepthMask(GL_TRUE);
 
@@ -759,28 +832,6 @@ static inline int nodeHashPut(Body *b, Vec3Int coord, int nodeIndex) {
     b->nodeHashVal[hs] = (uint32_t)nodeIndex;
     return 1;
 }
-static int faceHashFindSlot(const Body *b, uint32_t key) {
-    uint32_t h = faceHash0(key);
-    for (int i=0; i<FACEHASH_CAP; ++i) {
-        uint32_t k = b->faceHashKey[h];
-        if (k == FACEKEY_EMPTY) return -1;
-        if (k == key) return (int) h;
-        h = (h + 1) & FACEHASH_MASK;
-    }
-    return -1;
-}
-static int faceHashFindInsertSlot(const Body *b, uint32_t key) {
-    uint32_t h = faceHash0(key);
-    int firstTomb = -1;
-    for (int i=0; i<FACEHASH_CAP; ++i) {
-        uint32_t k = b->faceHashKey[h];
-        if (k == FACEKEY_EMPTY) return (firstTomb >= 0)? firstTomb : (int)h;
-        if (k == FACEKEY_TOMB && firstTomb < 0) firstTomb = (int)h;
-        if (k == key) return (int)h;
-        h = (h + 1) & FACEHASH_MASK;
-    }
-    return firstTomb;
-}
 static inline void adjAdd(Body *b, int a, int c, uint16_t ei) {
     uint8_t ca = b->adjCount[a], cc = b->adjCount[c];
     if (ca >= ADJ_MAX || cc >= ADJ_MAX) return;
@@ -789,7 +840,6 @@ static inline void adjAdd(Body *b, int a, int c, uint16_t ei) {
 }
 static inline void setEdgeType(Body *b, Edge *e, EdgeType t) {
     if (e->type == t) return;
-    if (e->type == EDGE_BONE) {b->boneDeg[e->a]--; b->boneDeg[e->b]--;}
     switch (t) {
         case EDGE_NONE: {
             b->topoDirty = 1; 
@@ -811,6 +861,11 @@ static inline void setEdgeType(Body *b, Edge *e, EdgeType t) {
             e->damping = 0.05f; 
             e->hp = 1; 
         } break;
+        case EDGE_FASCIA: {
+            e->k = 8.0f;
+            e->damping = 0.01f;
+            e->hp = 1;
+        }
         case EDGE_MUSCLE: {
             e->k = 4.0f; 
             e->damping = 0.03f; 
@@ -820,7 +875,6 @@ static inline void setEdgeType(Body *b, Edge *e, EdgeType t) {
             e->k = 0.0f; 
             e->damping = 0.0f;
             e->hp = 3;
-            b->boneDeg[e->a]++; b->boneDeg[e->b]++;
         } break;
     }
     wakeBody(b);
@@ -829,13 +883,13 @@ static inline void setEdgeType(Body *b, Edge *e, EdgeType t) {
 static inline void setNodeType(Body *b, Node *n, NodeType t) {
     if (t==NODE_NORMAL) {
         n->radius = 0.12f;
-        n->invMass = 1.0f;
+        n->mass = 1.0f;
     } else if (t==NODE_HEART) {
         n->radius = 0.16f;
-        n->invMass = 0.5f;
+        n->mass = 2.0f;
     } else if (t==NODE_WEAPON) {
         n->radius = 0.20f;
-        n->invMass = 1.25f;
+        n->mass = 0.8f;
     }
     n->type = t;
 }
@@ -844,8 +898,6 @@ static inline void nodeAlive(Body *b, Node *n, int8_t is) {
         n->alive = 1;
     } else {
         n->alive = 0;
-        n->invMass = 0.0f;
-        n->vel = v3(0, 0, 0);
         int ni = (int)(n - b->nodes);
         while (b->adjCount[ni] > 0) {
             uint16_t ei = b->adjEdge[ni][b->adjCount[ni] - 1];
@@ -868,37 +920,6 @@ static inline void jointCandAdd(Body *b, uint16_t n){
     if (b->jointCandSlot[n] >= 0) return;
     b->jointCandSlot[n] = (int16_t)b->jointCandCount;
     b->jointCandIdx[b->jointCandCount++] = n;
-}
-
-static void computeBoneDegree(Body *b) {
-    memset(b->boneDeg, 0, (size_t)b->nodeCount * sizeof(b->boneDeg[0]));
-    for (uint16_t i = 0; i < b->activeEdgeCount; ++i) {
-        Edge *e = &b->edges[b->activeEdgeIdx[i]];
-        if (e->type != EDGE_BONE) continue;
-        b->boneDeg[e->a]++; b->boneDeg[e->b]++;
-    }
-}
-static void solveDistance(Node *a, Node *b, float rest, float stiffness) {
-    Vec3 d = v3Sub(b->pos, a->pos);
-    float dist = v3Len(d) + 1e-6f;
-    float w1 = a->invMass, w2 = b->invMass, wsum = w1 + w2;
-    if (wsum <= 0.0f) return;
-
-    float C = dist - rest;                 // constraint error
-    float s = (C / dist) * stiffness;      // how hard to correct
-
-    // Move positions (weighted by inverse mass)
-    a->pos = v3Add(a->pos, v3Scale(d,  ( w1 / wsum) * s));
-    b->pos = v3Add(b->pos, v3Scale(d, -( w2 / wsum) * s));
-}
-static void solveBones(Body *b) {
-    const int iters = 10;
-    for (int it = 0; it < iters; ++it) {
-        for (uint16_t i = 0; i < b->activeEdgeCount; ++i) {
-            Edge *e = &b->edges[b->activeEdgeIdx[i]];
-            if (e->type == EDGE_BONE) solveDistance(&b->nodes[e->a], &b->nodes[e->b], e->restLen, 1.0f);
-        }
-    }
 }
 
 static void recomputeHeartDist(Body *b) {
@@ -927,153 +948,6 @@ static void cullDeadNodes(Body *b){
     }
 }
 
-static inline Vec3Int v3IntMin4(Vec3Int a, Vec3Int b, Vec3Int c, Vec3Int d) {
-    return v3Int(
-        (int)fminf(a.x, fminf(b.x, fminf(c.x, d.x))),
-        (int)fminf(a.y, fminf(b.y, fminf(c.y, d.y))),
-        (int)fminf(a.z, fminf(b.z, fminf(c.z, d.z)))
-    );
-}
-static inline Vec3Int v3IntMax4(Vec3Int a, Vec3Int b, Vec3Int c, Vec3Int d) {
-    return v3Int(
-        (int)fmaxf(a.x, fmaxf(b.x, fmaxf(c.x, d.x))),
-        (int)fmaxf(a.y, fmaxf(b.y, fmaxf(c.y, d.y))),
-        (int)fmaxf(a.z, fmaxf(b.z, fmaxf(c.z, d.z)))
-    );
-}
-static inline int coordInUnitCube(Vec3Int p, Vec3Int o) {
-    return (p.x >= o.x && p.x <= o.x+1 &&
-            p.y >= o.y && p.y <= o.y+1 &&
-            p.z >= o.z && p.z <= o.z+1);
-}
-static inline int cornerIndex(Vec3Int p, Vec3Int o) {
-    int dx = p.x - o.x;
-    int dy = p.y - o.y;
-    int dz = p.z - o.z;
-    return (dx<<2) | (dy<<1) | dz;
-}
-static inline Vec3Int cornerCoord(Vec3Int o, int idx) {
-    return v3Int(
-        o.x + ((idx>>2)&1),
-        o.y + ((idx>>1)&1),
-        o.z + (idx&1)
-    );
-}
-static void buildCubeTets(int outTets[6][4], int parity) {
-    if (parity == 0) {
-        int T[6][4] = {
-            {0,4,6,7},
-            {0,6,2,7},
-            {0,2,3,7},
-            {0,3,1,7},
-            {0,1,5,7},
-            {0,5,4,7},
-        };
-        memcpy(outTets, T, sizeof(T));
-    } else {
-        int T[6][4] = {
-            {4,0,2,3},
-            {4,2,6,3},
-            {4,6,7,3},
-            {4,7,5,3},
-            {4,5,1,3},
-            {4,1,0,3},
-        };
-        memcpy(outTets, T, sizeof(T));
-    }
-}
-
-static inline float latticeRestLen(const Node *a, const Node *b){
-    int d2 = v3IntDist2(b->lattice, a->lattice);
-    return REST_LEN * sqrtf((float)d2);
-}
-static void toggleFrontierFace(Body *b, uint16_t x, uint16_t y, uint16_t z, uint16_t inside) {
-    if (x==y || y==z || z==x) return;
-    uint32_t key = faceKey(x,y,z);
-    int hs = faceHashFindSlot(b, key);
-
-    if (hs >= 0) {
-        uint16_t fi = b->faceHashVal[hs];
-        if (fi < b->faceCount) b->frontier[fi].alive = 0;
-        b->faceHashKey[hs] = FACEKEY_TOMB;
-        b->faceHashVal[hs] = 0;
-        return;
-    }
-    if (b->faceCount >= MAX_FACES) return;
-
-    int ins = faceHashFindInsertSlot(b, key);
-    if (ins < 0) return;
-
-    uint16_t fi = (uint16_t)b->faceCount++;
-    Face *f = &b->frontier[fi];
-    f->a = x; f->b = y; f->c = z;
-    f->inside = inside;
-    f->alive = 1;
-
-    b->faceHashKey[ins] = key;
-    b->faceHashVal[ins] = fi;
-}
-static int findApexCoord(const Body *b, int ia, int ib, int ic, int iInside, Vec3Int *outApex) {
-    Vec3Int A = b->nodes[ia].lattice;
-    Vec3Int B = b->nodes[ib].lattice;
-    Vec3Int C = b->nodes[ic].lattice;
-    Vec3Int D = b->nodes[iInside].lattice;
-
-    int minx = (int)fminf(A.x, fminf(B.x, C.x));
-    int miny = (int)fminf(A.y, fminf(B.y, C.y));
-    int minz = (int)fminf(A.z, fminf(B.z, C.z));
-    int maxx = (int)fmaxf(A.x, fmaxf(B.x, C.x));
-    int maxy = (int)fmaxf(A.y, fmaxf(B.y, C.y));
-    int maxz = (int)fmaxf(A.z, fmaxf(B.z, C.z));
-
-    if ((maxx - minx) > 1 || (maxy - miny) > 1 || (maxz - minz) > 1) return 0;
-
-    Vec3Int candidates[16];
-    int candCount = 0;
-
-    for (int ox = minx - 1; ox <= minx; ++ox) {
-        for (int oy = miny - 1; oy <= miny; ++oy) {
-            for (int oz = minz - 1; oz <= minz; ++oz) {
-                Vec3Int o = v3Int(ox, oy, oz);
-
-                if (!coordInUnitCube(A, o) || !coordInUnitCube(B, o) || !coordInUnitCube(C, o)) continue;
-
-                int a  = cornerIndex(A, o);
-                int b2 = cornerIndex(B, o);
-                int c2 = cornerIndex(C, o);
-
-                int tets[6][4];
-                buildCubeTets(tets, 0);
-
-                for (int ti = 0; ti < 6; ++ti) {
-                    int hasA=0, hasB=0, hasC=0;
-                    int apexIdx = -1;
-                    for (int k=0; k<4; ++k) {
-                        int v = tets[ti][k];
-                        if (v == a) hasA = 1;
-                        else if (v == b2) hasB = 1;
-                        else if (v == c2) hasC = 1;
-                        else apexIdx = v;
-                    }
-                    if (!(hasA && hasB && hasC)) continue;
-                    if (apexIdx < 0) continue;
-
-                    Vec3Int apex = cornerCoord(o, apexIdx);
-
-                    // Exclude the "inside" tetra apex, if relevant
-                    if (apex.x == D.x && apex.y == D.y && apex.z == D.z) continue;
-
-                    // If apex already exists in this body, face is not frontier
-                    if (nodeHashGet(b, apex) >= 0) continue;
-                    candidates[candCount++] = apex;
-                }
-            }
-        }
-    }
-    if (candCount == 0) return 0;
-    *outApex = candidates[rand() % candCount];
-    return 1;
-}
 static int  addEdge(Body *b, int a, int c, EdgeType type) {
     if (a==c) return 0;
     if (a >= b->nodeCount || c >= b->nodeCount) return 0;
@@ -1100,7 +974,7 @@ static int  addEdge(Body *b, int a, int c, EdgeType type) {
     e->activeSlot = b->activeEdgeCount;
     b->activeEdgeIdx[b->activeEdgeCount++] = (uint16_t)ei;
     setEdgeType(b, e, type);
-    e->restLen = latticeRestLen(&b->nodes[a], &b->nodes[c]);
+    e->restLen = v3Dist(b->nodes[a].pos, b->nodes[c].pos);
     e->muscleTargetMul=0.5f; e->muscleSignal=0.5f;
 
     adjAdd(b, a, c, (uint16_t)ei);
@@ -1117,213 +991,184 @@ static inline float parentScore(Body *b, int childIdx, int parentIdx) {
 
     return linearity;
 }
-static uint16_t seedNode(Body *b, Vec3Int lattice, NodeType t, uint16_t armatureID) {
+static uint16_t seedNode(Body *b, Vec3 pos, NodeType t, uint16_t armA, uint16_t armB) {
     if (b->nodeCount >= NODES_PER_BODY) return UINT16_MAX;
-    if (nodeHashGet(b, lattice) >= 0) return UINT16_MAX;
 
     uint16_t i = b->nodeCount++;
     Node *n = &b->nodes[i];
     memset(n, 0, sizeof(*n));
     n->alive  = 1;
-    n->armatureID = armatureID;
-    n->lattice = lattice;
-    n->pos = v3Add(b->nodes[0].pos, v3Scale(v3IntTov3(lattice), REST_LEN));
-    n->vel = v3(0,0,0); 
-    n->force = v3(0,0,0);
+    n->armatureIDA = armA;
+    n->armatureIDB = armB;
+    n->pos = pos;
     n->distHeart = 0;
     
-    setNodeType(b, &b->nodes[i], t);
-    if (!nodeHashPut(b, n->lattice, i)) {b->nodeCount--; return UINT16_MAX;}
-
+    setNodeType(b, n, t);
     return i;
 }
-static int seedBoneonNode(Body *b, uint16_t J) {
-    if (!b->nodes[J].alive) return 0;
-    if (b->adjCount[J] != 3) return 0;
-    if (b->nodeCount + 2 >= NODES_PER_BODY) return 0;
-    if (b->edgeCount + 11 >= EDGES_PER_BODY) return 0;
+static uint16_t newArmature(Body*b) {
+    uint16_t id = b->nextArmatureID++;
+    if (id >= MAX_ARMATURES) return UINT16_MAX;
 
-    uint16_t A = b->adjNode[J][0], B = b->adjNode[J][1], C = b->adjNode[J][2];
-    Vec3Int Jc = b->nodes[J].lattice;
+    Armature *arm = &b->armatures[id];
+    uint16_t nodes[NODES_PER_ARMATURE];
 
-    Vec3Int Ap = v3IntSub(v3IntScale(Jc,2), b->nodes[A].lattice);
-    Vec3Int Bp = v3IntSub(v3IntScale(Jc,2), b->nodes[B].lattice);
-    Vec3Int Cp = v3IntSub(v3IntScale(Jc,2), b->nodes[C].lattice);
+    arm->armatureID = id;
+    arm->nodeCount = 0;
+    arm->pos = v3(0, 0, 0);
+    arm->vel = v3(0, 0, 0);
+    arm->force = v3(0, 0, 0);
+    arm->rot = quatIdentity();
+    arm->angVel = v3(0, 0, 0);
+    arm->torque = v3(0, 0, 0);
+    arm->mass = 0.0f;
+    arm->invInertiaLocal = mat3Identity();
+    arm->invMass = 0.0f;
+    arm->radius = 0.0f;
 
-    if (nodeHashGet(b, Ap) >= 0) return 0;
-    if (nodeHashGet(b, Bp) >= 0) return 0;
-    if (nodeHashGet(b, Cp) >= 0) return 0;
-
-    uint16_t armatureID = b->nextArmatureID++;
-
-    uint16_t iAp = seedNode(b, Ap, NODE_NORMAL, armatureID);
-    uint16_t iBp = seedNode(b, Bp, NODE_NORMAL, armatureID);
-    uint16_t iCp = seedNode(b, Cp, NODE_NORMAL, armatureID);
-    if (iAp==UINT16_MAX || iBp==UINT16_MAX || iCp==UINT16_MAX) return 0;
-
-    if (!addEdge(b, J,   iAp, EDGE_BONE)) return 0;
-    if (!addEdge(b, J,   iBp, EDGE_BONE)) return 0;
-    if (!addEdge(b, J,   iCp, EDGE_BONE)) return 0;
-    if (!addEdge(b, iAp, iBp, EDGE_BONE)) return 0;
-    if (!addEdge(b, iBp, iCp, EDGE_BONE)) return 0;
-    if (!addEdge(b, iCp, iAp, EDGE_BONE)) return 0;
-    
-    if (!addEdge(b, iAp, B, EDGE_MUSCLE)) return 0;
-    if (!addEdge(b, iAp, C, EDGE_MUSCLE)) return 0;
-    if (!addEdge(b, iBp, C, EDGE_MUSCLE)) return 0;
-    if (!addEdge(b, iBp, A, EDGE_MUSCLE)) return 0;
-    if (!addEdge(b, iCp, A, EDGE_MUSCLE)) return 0;
-    if (!addEdge(b, iCp, B, EDGE_MUSCLE)) return 0;
-    
-    toggleFrontierFace(b, iAp, iBp, iCp, J);
-
-    return 1;
-}
-static int seedNodeonFace(Body *b, int faceIndex, EdgeType type) {
-    Face *f = &b->frontier[faceIndex];
-    if (!f->alive) return 0;
-    if (b->nodeCount >= NODES_PER_BODY) return 0;
-    if (b->edgeCount + 2 >= EDGES_PER_BODY) return 0;
-    Vec3Int apex;
-    if (!findApexCoord(b, f->a, f->b, f->c, f->inside, &apex)){
-        f->alive = 0;
-        b->topoDirty = 1;
-        return 0;
-    }
-    
-    toggleFrontierFace(b, f->a, f->b, f->c, f->inside);
-
-    if (b->adjCount[f->a] >= ADJ_MAX ||
-        b->adjCount[f->b] >= ADJ_MAX ||
-        b->adjCount[f->c] >= ADJ_MAX)
-    {return 0;}
-
-    uint16_t armID = b->nodes[f->a].armatureID;
-    uint16_t ni = seedNode(b, apex, NODE_NORMAL, armID);
-    if (ni == UINT16_MAX) return 0;
-
-    if (!addEdge(b, ni, f->a, type)) return 0;
-    if (!addEdge(b, ni, f->b, type)) return 0;
-    if (!addEdge(b, ni, f->c, type)) return 0;
-
-    f->alive = 0;
-    toggleFrontierFace(b, f->a, f->b, ni, f->c);
-    toggleFrontierFace(b, f->b, f->c, ni, f->a);
-    toggleFrontierFace(b, f->c, f->a, ni, f->b);
-    
-    jointCandRemove(b, f->a);
-    jointCandRemove(b, f->b);
-    jointCandRemove(b, f->c);
-    jointCandAdd(b, ni);
-
-    b->topoDirty = 1;
-    wakeBody(b);
-    return 1;
+    b->armatureCount++;
+    return id;
 }
 static void rebuildArmatures(Body *b) {
     b->armatureCount = 0;
+    for (uint16_t a = 0; a < MAX_ARMATURES; ++a) {
+        Armature *armA = &b->armatures[a];
+        armA->nodeCount = 0;
+        armA->armatureID = a;
+        armA->mass = 0;
+        armA->invInertiaLocal = mat3Identity();
+        armA->rot = quatIdentity();
+        armA->pos = v3(0, 0, 0);
+        for (uint16_t i = 0; i < NODES_PER_BODY; ++i) {
+            armA->nodeLocalID[i] = UINT16_MAX;
+        }   
+    }
+    uint16_t maxID = 0;
     for (uint16_t i = 0; i < b->nodeCount; ++i) {
         if (!b->nodes[i].alive) continue;
 
-        uint16_t id = b->nodes[i].armatureID;
+        uint16_t idA = b->nodes[i].armatureIDA;
+        uint16_t idB = b->nodes[i].armatureIDB;
 
-        int armatureIndex = -1;
+        if (idA > maxID) maxID = idA;
+        if (idB > maxID) maxID = idB;
 
-        for (uint16_t a = 0; a < b->armatureCount; ++a) {
-            if (b->armatures[a].armatureID == id) {
-                armatureIndex = a;
-                break;
-            }
-        }
+        Armature *armA = &b->armatures[idA];
+        if (armA->nodeCount >= NODES_PER_ARMATURE) continue;
+        armA->nodeLocalID[i] = armA->nodeCount;
+        armA->nodes[armA->nodeCount++] = i;
 
-        if (armatureIndex < 0) {
-            if (b->armatureCount >= MAX_ARMATURES) continue;
-            
-            armatureIndex = b->armatureCount++;
-            b->armatures[armatureIndex].armatureID = id;
-            b->armatures[armatureIndex].nodeCount = 0;
-        }
-
-        Armature *arm = &b->armatures[armatureIndex];
-
-        if (arm->nodeCount < MAX_NODES_PER_ARMATURE) {
-            arm->nodes[arm->nodeCount++] = i;
+        if (idA != idB) {
+            Armature *armB = &b->armatures[idB];
+            if (armB->nodeCount >= NODES_PER_ARMATURE) continue;
+            armB->nodeLocalID[i] = armB->nodeCount;
+            b->armatures[idB].nodes[armB->nodeCount++] = i;
         }
     }
-}
-static void updateArmatureBounds(Body *b) {
+    b->armatureCount = maxID + 1;
     for (uint16_t a = 0; a < b->armatureCount; ++a) {
         Armature *arm = &b->armatures[a];
+        if (arm->nodeCount == 0) continue;
 
-        Vec3 center = v3(0, 0, 0);
-
-        for (uint16_t i = 0; i < arm->nodeCount; ++i) {
-            center = v3Add(center, b->nodes[arm->nodes[i]].pos);
+        Vec3 comT = v3(0, 0, 0);
+        float mass = 0.0f;
+        for (uint16_t j = 0; j < arm->nodeCount; ++j) {
+            Node *n = &b->nodes[arm->nodes[j]];
+            comT = v3Add(comT, v3Scale(n->pos, n->mass));
+            mass += n->mass;
         }
 
-        center = v3Scale(center, 1.0f / (float)arm->nodeCount);
-        float r2 = 0.0f;
+        arm->mass = mass;
+        arm->invMass = mass > 0.0f ? 1.0f / mass : 0.0f;
+        arm->pos = v3Scale(comT, arm->invMass);
 
-        for (uint16_t i = 0; i < arm->nodeCount; ++i) {
-            Vec3 d = v3Sub(b->nodes[arm->nodes[i]].pos, center);
-            float dLen = v3Len(d) + b->nodes[arm->nodes[i]].radius;
-            float d2 = dLen * dLen;
-            if (d2 > r2) r2 = d2;
+        for (uint16_t j = 0; j < arm->nodeCount; ++j) {
+            Node *n = &b->nodes[arm->nodes[j]];
+            arm->localPos[j] = v3Sub(n->pos, arm->pos);
         }
 
-        arm->center = center;
-        arm->radius = sqrtf(r2);
+        Mat3 I = mat3Zero();
+
+        for (int j = 0; j < arm->nodeCount; ++j) {
+            Node *n = &b->nodes[arm->nodes[j]];
+            Vec3 r = arm->localPos[j];
+            float m = n->mass;
+            I.m[0][0] += m * (r.y*r.y + r.z*r.z);
+            I.m[1][1] += m * (r.x*r.x + r.z*r.z);
+            I.m[2][2] += m * (r.x*r.x + r.y*r.y);
+            I.m[0][1] -= m * r.x*r.y;
+            I.m[0][2] -= m * r.x*r.z;
+            I.m[1][2] -= m * r.y*r.z;
+        }
+
+        I.m[1][0] = I.m[0][1];
+        I.m[2][0] = I.m[0][2];
+        I.m[2][1] = I.m[1][2];
+
+        arm->invInertiaLocal = mat3Inverse(I);
     }
 }
+static void recomputeArmatureCOM(Body *b, Armature *a) {
+    Vec3 center = v3(0, 0, 0);
+    float totalMass = 0.0f;
+
+    for (uint16_t i = 0; i < a->nodeCount; ++i) {
+        float mass = b->nodes[a->nodes[i]].mass;
+        center = v3Add(center, v3Scale(a->localPos[i], mass));
+        totalMass += mass;
+    }
+
+    center = v3Scale(center, 1.0f / totalMass);
+    a->pos = v3Add(a->pos, quatRotate(a->rot, center));
+
+    for (uint16_t i = 0; i < a->nodeCount; ++i) {
+        a->localPos[i] = v3Sub(a->localPos[i], center);
+    }
+}
+static void recomputeArmatureBounds(Body *b, Armature *a) {
+    float r2 = 0.0f;
+
+    for (uint16_t i = 0; i < a->nodeCount; ++i) {
+        Node *n = &b->nodes[a->nodes[i]];
+        float dLen = v3Len(a->localPos[i]) + n->radius;
+        float d2 = dLen * dLen;
+        if (d2 > r2) r2 = d2;
+    }
+
+    a->radius = sqrtf(r2);
+}
+
 static void skeletonLattice(Body *b, Vec3 center) {
     b->edgeCount = 0;
     b->activeEdgeCount = 0;
-    b->faceCount = 0;
     b->jointCandCount = 0;
     b->nodeCount = 0;
     b->armatureCount = 0;
-    b->nextArmatureID = 2;
+    b->nextArmatureID = 0;
 
-    
-    seedNode(b, v3Int(0,0,0), NODE_HEART, 1);
-    b->nodes[0].pos = center;
-    seedNode(b, v3Int(1,0,0), NODE_NORMAL, 1);
-    seedNode(b, v3Int(1,1,0), NODE_NORMAL, 1);
-    seedNode(b, v3Int(1,1,1), NODE_NORMAL, 1);
+    uint16_t heart = newArmature(b);
+    uint16_t ribcage = newArmature(b);
+    seedNode(b, center, NODE_HEART, heart, heart);
+    seedNode(b, v3Add(center, v3( 0, 0, 1)), NODE_NORMAL, ribcage, ribcage);
+    seedNode(b, v3Add(center, v3( 0, 1, 0)), NODE_NORMAL, ribcage, ribcage);
+    seedNode(b, v3Add(center, v3( 1, 0, 0)), NODE_NORMAL, ribcage, ribcage);
+    seedNode(b, v3Add(center, v3( 0, 0,-1)), NODE_NORMAL, ribcage, ribcage);
+    seedNode(b, v3Add(center, v3( 0,-1, 0)), NODE_NORMAL, ribcage, ribcage);
+    seedNode(b, v3Add(center, v3(-1, 0, 0)), NODE_NORMAL, ribcage, ribcage);
 
-    jointCandAdd(b, 0); jointCandAdd(b, 1); jointCandAdd(b, 2); jointCandAdd(b, 3);
+    addEdge(b, 0, 1, EDGE_FASCIA);
+    addEdge(b, 0, 2, EDGE_FASCIA);
+    addEdge(b, 0, 3, EDGE_FASCIA);
+    addEdge(b, 0, 4, EDGE_FASCIA);
+    addEdge(b, 0, 5, EDGE_FASCIA);
+    addEdge(b, 0, 6, EDGE_FASCIA);
 
-    addEdge(b, 0,1, EDGE_BONE); addEdge(b, 0,2, EDGE_BONE); addEdge(b, 0,3, EDGE_BONE); addEdge(b, 1,2, EDGE_BONE); addEdge(b, 1,3, EDGE_BONE); addEdge(b, 2,3, EDGE_BONE);
-    toggleFrontierFace(b, 1,2,3, 0); toggleFrontierFace(b, 0,2,3, 1); toggleFrontierFace(b, 0,1,3, 2); toggleFrontierFace(b, 0,1,2, 3);
-
-    if (b->faceCount == 0) {
-        computeBoneDegree(b);
-        return;
-    }
-
-    while (b->nodeCount < NODES_PER_BODY) {
-            if ((rand() % 6 > 0 && b->jointCandCount > 0) || (b->nextArmatureID > ARMATURES_PER_BODY)) {
-            int tries = 0;
-            int fi = -1;
-            while (tries++ < 64) {
-                int r = rand() % b->faceCount;
-                if (b->frontier[r].alive) {fi = r; break;}
-            }
-            if (fi < 0) {
-                for (int i = 0; i < b->faceCount; ++i) {
-                    if (b->frontier[i].alive) {
-                        fi = i;
-                        break;
-                    }
-                }
-            }
-            if (fi < 0) break;
-            seedNodeonFace(b, fi, EDGE_BONE);
-        } else {seedBoneonNode(b, b->jointCandIdx[rand() % b->jointCandCount]);}
-    }
-    computeBoneDegree(b);
     rebuildArmatures(b);
-    updateArmatureBounds(b);
+    for (int i; i < b->armatureCount; i++) {
+        Armature *a = &b->armatures[i];
+        recomputeArmatureCOM(b, a);
+        recomputeArmatureBounds(b, a);
+    }
 }
 static void generateDNA(Genetics *g) {
     g->linearity = irandRange(1, ADJ_MAX);
@@ -1337,7 +1182,7 @@ static void makeRandomOrganism(int slot, Vec3 center) {
     Body *b = &gBodies[slot];
     Genetics *g = &b->genes;
     b->id = (uint16_t)(slot + 1);
-    b->edgeCount = 0; b->activeEdgeCount = 0; b->faceCount = 0; b->nodeCount = 0;
+    b->edgeCount = 0; b->activeEdgeCount = 0; b->nodeCount = 0;
     for (int i=0; i<NODES_PER_BODY; ++i) b->adjCount[i] = 0;
     for (int i=0; i<EDGEHASH_CAP; ++i) {
         b->edgeHashKey[i] = EDGEKEY_EMPTY;
@@ -1347,10 +1192,6 @@ static void makeRandomOrganism(int slot, Vec3 center) {
         b->nodeHashKey[i] = NODEKEY_EMPTY;
         b->nodeHashVal[i] = 0;
     }
-    for (int i=0; i<FACEHASH_CAP; ++i) {
-        b->faceHashKey[i] = FACEKEY_EMPTY;
-        b->faceHashVal[i] = 0;
-    }
     for (int i=0; i<NODES_PER_BODY; ++i) b->jointCandSlot[i] = -1;
     b->sleeping = 0;
     b->sleepFrames = 0;
@@ -1359,7 +1200,6 @@ static void makeRandomOrganism(int slot, Vec3 center) {
     generateDNA(g);
 
     skeletonLattice(b, center);
-    //randomLinks(b, 8 + (rand()%6));             // 8–13 extra edges
 
     bodyBounds(b);
 }
@@ -1377,10 +1217,24 @@ static void populateWorld(int count) {
 
 
 
-static void applyImpulse(Node *n, Vec3 J){
-    if (n->invMass <= 0.0f) return;
-    n->vel = v3Add(n->vel, v3Scale(J, n->invMass));
+static void updateNodesFromArmatures(Body *b) {
+    for (uint16_t ai = 0; ai < b->armatureCount; ++ai) {
+        Armature *a = &b->armatures[ai];
+        for (uint16_t i = 0; i < a->nodeCount; ++i) {
+            Node *n = &b->nodes[a->nodes[i]];
+            n->pos = v3Add(a->pos, quatRotate(a->rot, a->localPos[i]));
+        }
+    }
 }
+static void applyForceAtNode(Body *b, uint16_t nodeIndex, Vec3 f) {
+    Node *n = &b->nodes[nodeIndex];
+    Armature *a = &b->armatures[n->armatureIDA];
+    if (a->invMass <= 0.0f) return;
+    a->force = v3Add(a->force, f);
+    Vec3 r = v3Sub(n->pos, a->pos);
+    a->torque = v3Add(a->torque, v3Cross(r, f));
+}
+/*
 static Vec3 closestPointSeg(Vec3 p, Vec3 a, Vec3 b, float *outT){
     Vec3 ab = v3Sub(b,a);
     float t = CLAMP01(v3Dot(v3Sub(p,a), ab) / (v3DotSq(ab) + 1e-8f));
@@ -1440,58 +1294,80 @@ static void weaponStepAll(Body *self, int wi){
         }
     }
 }
-
-static void clearForces(Node* n, int count) {
-    for (int i = 0; i < count; ++i) v3Zero(&n[i].force);
-}
-static void updateVelFromPos(Node *n, Vec3 *oldPos, int count, float dt) {
-    float invDt = (dt > 0.0f) ? (1.0f / dt) : 0.0f;
-    for (int i = 0; i < count; ++i) {
-        n[i].vel = v3Scale(v3Sub(n[i].pos, oldPos[i]), invDt);
+*/
+static void clearForces(Body *b) {
+    for (uint16_t i = 0; i < b->armatureCount; ++i) {
+        v3Zero(&b->armatures[i].force); 
+        v3Zero(&b->armatures[i].torque);
     }
 }
 
-static void applySpring(Node* a, Node* b, float rest, float k, float damp) {
-    Vec3 pos = v3Sub(b->pos, a->pos);
+static Vec3 nodeWorldVelocity(Body *b, uint16_t ni) {
+    Node *n = &b->nodes[ni];
+    Armature *a = &b->armatures[n->armatureIDA];
+    Vec3 r = v3Sub(n->pos, a->pos);
+    return v3Add(a->vel, v3Cross(a->angVel, r));
+}
+static void applySpring(Body *b, Edge* e, float rest, float k, float damp) {
+    Node *a = &b->nodes[e->a];
+    Node *c = &b->nodes[e->b];
+    Vec3 pos = v3Sub(c->pos, a->pos);
     float dist = v3Len(pos) + 1e-6f;
-    k *= dist / rest;
-    pos = v3Scale(pos, 1/dist);
-    Vec3 relVel = v3Sub(b->vel, a->vel);
-    float vrel = v3Dot(pos, relVel);
-    float f = k * (dist - rest) + damp * vrel;
-    pos = v3Scale(pos, f);
-    a->force = v3Add(a->force, pos);
-    b->force = v3Sub(b->force, pos);
-}
-static void applyRepulsion(Node *a, Node *b, Vec3 normal, float dist, float range, float k, float damp) {
-    if (dist >=range) return;
+    Vec3 n = v3Scale(pos, 1/dist);
+    Vec3 relVel = v3Sub(nodeWorldVelocity(b, e->b), nodeWorldVelocity(b, e->a));
+    float vrel = v3Dot(n, relVel);
+    float fMag = k * (dist - rest) + damp * vrel;
+    Vec3 f = v3Scale(n, fMag);
 
-    float wsum = a->invMass + b->invMass;
-    if (wsum <= 0.0f) return;
-
-    float x = CLAMP01(1.0f - dist / range);
-    float fRepel = k * x * x;
-
-    Vec3 relVel = v3Sub(b->vel, a->vel);
-    float vn = v3Dot(relVel, normal);
-
-    float fDamp = 0.0f;
-    if (vn < 0.0f) {
-        fDamp = -damp * vn * x * x;
-    }
-
-    Vec3 f = v3Scale(normal, fRepel + fDamp);
-
-    a->force = v3Sub(a->force, f);
-    b->force = v3Add(b->force, f);
+    applyForceAtNode(b, e->a, f);
+    applyForceAtNode(b, e->b, v3Scale(f, -1.0f));
 }
 static void applyAllSprings(Body *b) {
     for (uint16_t i=0; i<b->activeEdgeCount; ++i) {
         Edge *e = &b->edges[b->activeEdgeIdx[i]];
-        float rest = e->restLen;
+        if (e->type == EDGE_NONE) continue;
         if (e->type == EDGE_BONE) continue;
+        if (e->type == EDGE_TENDON) {
+            Node *a = &b->nodes[e->a];
+            Node *c = &b->nodes[e->b];
+
+            Vec3 d = v3Sub(c->pos, a->pos);
+            float dist = v3Len(d);
+            if (dist > e->restLen * TENDON_SNAP_MUL) {
+                Vec3 n = v3Scale(d, 1.0f / dist);
+                Vec3 p = v3Average(a->pos, c->pos);
+
+                HitFX fx = FX_ON_BREAK[EDGE_TENDON];
+                setEdgeType(b, e, EDGE_NONE);
+                spawnBreakFX(p, n, fx.count, fx.r, fx.g, fx.b, fx.a);
+
+                b->topoDirty = 1;
+                wakeBody(b);
+                continue;
+            }
+        }
+        if (e->type == EDGE_FASCIA) {
+            Node *a = &b->nodes[e->a];
+            Node *c = &b->nodes[e->b];
+
+            Vec3 d = v3Sub(c->pos, a->pos);
+            float dist = v3Len(d);
+            if (dist > e->restLen * FASCIA_SNAP_MUL) {
+                Vec3 n = v3Scale(d, 1.0f / dist);
+                Vec3 p = v3Average(a->pos, c->pos);
+
+                HitFX fx = FX_ON_BREAK[EDGE_FASCIA];
+                setEdgeType(b, e, EDGE_NONE);
+                spawnBreakFX(p, n, fx.count, fx.r, fx.g, fx.b, fx.a);
+
+                b->topoDirty = 1;
+                wakeBody(b);
+                continue;
+            }
+        }
+        float rest = e->restLen;
         if (e->type == EDGE_MUSCLE) {float s = CLAMP01(e->muscleSignal); rest *= 1.0f - s * (1.0f - e->muscleTargetMul);}
-        applySpring(&b->nodes[e->a], &b->nodes[e->b], rest, e->k, e->damping);
+        applySpring(b, e, rest, e->k, e->damping);
     }
 }
 static void updateMuscleSignals(Body *b) {
@@ -1509,101 +1385,85 @@ static void updateMuscleSignals(Body *b) {
         e->muscleSignal = 0.5f + 0.5f * sinf(omega * gSimTime + phase);
     }
 }
+static void resolveBounds(Body *b) {
+    const float bounce = -0.8f;
+    for (int i = 0; i < b->armatureCount; i++) {
+        Armature *a = &b->armatures[i];
+        const float r = a->radius;
+        const float minX = -WORLD_X + r;
+        const float maxX = WORLD_X - r;
+        const float minY = -WORLD_Y + r;
+        const float maxY = WORLD_Y - r;
+        const float minZ = -WORLD_Z + r;
+        const float maxZ = WORLD_Z - r;
 
-static void resolveBounds(Node *n) {
-    const float bounce = 0.8f;
+        if (a->pos.x < minX) {
+            a->pos.x = minX;
+            a->vel.x *= bounce;
+        } else if (a->pos.x > maxX) {
+            a->pos.x = maxX;
+            a->vel.x *= bounce;
+        }
 
-    if (n->pos.x < -WORLD_X) {
-        n->pos.x = -WORLD_X;
-        n->vel.x *= -bounce;
-    } else if (n->pos.x > WORLD_X) {
-        n->pos.x = WORLD_X;
-        n->vel.x *= -bounce;
-    }
+        if (a->pos.y < minY) {
+            a->pos.y = minY;
+            a->vel.y *= bounce;
+        } else if (a->pos.y > maxY) {
+            a->pos.y = maxY;
+            a->vel.y *= bounce;
+        }
 
-    if (n->pos.y < -WORLD_Y) {
-        n->pos.y = -WORLD_Y;
-        n->vel.y *= -bounce;
-    } else if (n->pos.y > WORLD_Y) {
-        n->pos.y = WORLD_Y;
-        n->vel.y *= -bounce;
-    }
-
-    if (n->pos.z < -WORLD_Z) {
-        n->pos.z = -WORLD_Z;
-        n->vel.z *= -bounce;
-    } else if (n->pos.z > WORLD_Z) {
-        n->pos.z = WORLD_Z;
-        n->vel.z *= -bounce;
-    }
+        if (a->pos.z < minZ) {
+            a->pos.z = minZ;
+            a->vel.z *= bounce;
+        } else if (a->pos.z > maxZ) {
+            a->pos.z = maxZ;
+            a->vel.z *= bounce;
+        }
+    }    
 }
-static void integrate(Node* n, int count, float dt, const uint8_t *boneDeg) {
+static inline void integrateRotation(Quat *q, Vec3 angVel, float dt) {
+    Quat w = {0, angVel.x, angVel.y, angVel.z};
+    Quat dq = quatMul(w, *q);
+    q->w += 0.5f * dq.w * dt;
+    q->x += 0.5f * dq.x * dt;
+    q->y += 0.5f * dq.y * dt;
+    q->z += 0.5f * dq.z * dt;
+    *q = quatNormalize(*q);
+}
+static void integrate(Body *b, float dt) {
     float damp = fmaxf(0.0f, 1.0f - GLOBAL_DAMPING * dt);
-
-    for (int i = 0; i < count; ++i) {
-        if (!n[i].alive) continue;
-        float invm = n[i].invMass / (1.0f + (float)boneDeg[i]);
-        n[i].vel = v3Scale(v3Add(n[i].vel, v3Scale(n[i].force, invm * dt)), damp);
-        n[i].pos = v3Add(n[i].pos, v3Scale(n[i].vel, dt));
-        resolveBounds(&n[i]);
-    }
-}
-static void applyNodeRepulsions(Body *b) {
-    const float range = REST_LEN * 0.5f;
-    const float k = 800.0f;
-    const float damp = 8.0f;
 
     for (uint16_t i = 0; i < b->armatureCount; ++i) {
         Armature *a = &b->armatures[i];
-        for (uint16_t j = i + 1; j < b->armatureCount; ++j) {
-            Armature *c = &b->armatures[j];
-            
-            Vec3 d = v3Sub(c->center, a->center);
-            float maxDist = a->radius + c->radius + range;
-            if (v3DotSq(d) > maxDist * maxDist) continue;
-
-            for (uint16_t ni = 0; ni < a->nodeCount; ++ni) {
-                Node *na = &b->nodes[a->nodes[ni]];
-                for (uint16_t nj = 0; nj < c->nodeCount; ++nj) {
-                    Node *nb = &b->nodes[c->nodes[nj]];
-
-                    Vec3 diff = v3Sub(nb->pos, na->pos);
-                    float d2 = v3DotSq(diff);
-                    if (d2 < 1e-8f) continue;
-
-                    float dist = sqrtf(d2);
-                    float effectiveRange = range + na->radius + nb->radius;
-                    if (dist >= effectiveRange) continue;
-
-                    Vec3 n = v3Scale(diff, 1.0f / dist);
-                    applyRepulsion(na, nb, n, dist, effectiveRange, k, damp);
-                }
-            }
-        }
+        if (a->invMass <= 0.0f) continue;
+        a->vel = v3Scale(v3Add(a->vel, v3Scale(a->force, a->invMass * dt)), damp);
+        a->pos = v3Add(a->pos, v3Scale(a->vel, dt));
+        Vec3 localTorque = quatRotate(quatConjugate(a->rot), a->torque);
+        Vec3 localAlpha = mat3MulVec3(a->invInertiaLocal, localTorque);
+        Vec3 worldAlpha = quatRotate(a->rot, localAlpha);
+        a->angVel = v3Scale(v3Add(a->angVel, v3Scale(worldAlpha, dt)), damp);
+        integrateRotation(&a->rot, a->angVel, dt);
     }
 }
 static void physicsTickBody(Body *b, float dt) {
     if (b->sleeping) return;
 
-    Vec3 oldPos[NODES_PER_BODY];
-    for (int i = 0; i < b->nodeCount; ++i) oldPos[i] = b->nodes[i].pos;
-
     for (int s = 0; s < PHYSICS_STEPS; ++s) {
-        clearForces(b->nodes, b->nodeCount);
         //updateMuscleSignals(b);
         applyAllSprings(b);
-        applyNodeRepulsions(b);
-        integrate(b->nodes, b->nodeCount, dt / PHYSICS_STEPS, b->boneDeg);
-
-        solveBones(b);
+        integrate(b, dt / PHYSICS_STEPS);
+        resolveBounds(b);
+        updateNodesFromArmatures(b);
+        clearForces(b);
     }
-    updateVelFromPos(b->nodes, oldPos, b->nodeCount, dt);
+
 
     if (0 && bodyIsQuiet(b)) {
         b->sleepFrames++;
         if (b->sleepFrames >= SLEEP_FRAMES) {
             b->sleeping = 1;
-            for (int i=0;i<b->nodeCount;i++) v3Zero(&b->nodes[i].vel);
+            for (int i=0;i<b->armatureCount;i++) v3Zero(&b->armatures[i].vel);
             return;
         }
     } else {
@@ -1617,20 +1477,20 @@ static void physicsTickBody(Body *b, float dt) {
 
 static void kickBody(Body *b, float impulse) {
     wakeBody(b);
-    for (int i = 0; i < b->nodeCount; ++i) {
-        if (b->nodes[i].invMass <= 0.0f) continue;
-        b->nodes[i].vel.x += (frand01()*2.0f - 1.0f) * impulse;
-        b->nodes[i].vel.y += (frand01()*2.0f - 1.0f) * impulse;
-        b->nodes[i].vel.z += (frand01()*2.0f - 1.0f) * impulse;
+    for (int i = 0; i < b->armatureCount; ++i) {
+        if (b->armatures[i].invMass <= 0.0f) continue;
+        b->armatures[i].force.x += (frand01()*2.0f - 1.0f) * impulse;
+        b->armatures[i].force.y += (frand01()*2.0f - 1.0f) * impulse;
+        b->armatures[i].force.z += (frand01()*2.0f - 1.0f) * impulse;
     }
 }
 static void offsetBody(Body *b, float amount) {
     wakeBody(b);
-    for (int i = 0; i < b->nodeCount; ++i) {
-        if (b->nodes[i].invMass <= 0.0f) continue;
-        b->nodes[i].pos.x += (frand01()*2.0f - 1.0f) * amount;
-        b->nodes[i].pos.y += (frand01()*2.0f - 1.0f) * amount;
-        b->nodes[i].pos.z += (frand01()*2.0f - 1.0f) * amount;
+    for (int i = 0; i < b->armatureCount; ++i) {
+        if (b->armatures[i].invMass <= 0.0f) continue;
+        b->armatures[i].pos.x += (frand01()*2.0f - 1.0f) * amount;
+        b->armatures[i].pos.y += (frand01()*2.0f - 1.0f) * amount;
+        b->armatures[i].pos.z += (frand01()*2.0f - 1.0f) * amount;
     }
 }
 static int handleInput (Camera *cam) {
@@ -1647,7 +1507,7 @@ static int handleInput (Camera *cam) {
         }
         else if (e.type == SDL_KEYDOWN) {
             if (e.key.keysym.sym == SDLK_ESCAPE) return 0;
-            if (e.key.keysym.sym == SDLK_k) for (int i=0;i<gBodyCount;i++) kickBody(&gBodies[i], 2.0f);
+            if (e.key.keysym.sym == SDLK_k) for (int i=0;i<gBodyCount;i++) kickBody(&gBodies[i], 500.0f * PHYSICS_STEPS);
             if (e.key.keysym.sym == SDLK_o) for (int i=0;i<gBodyCount;i++) offsetBody(&gBodies[i], 0.25f);
         }
     }
@@ -1693,9 +1553,10 @@ int main(int argc, char **argv) {
         for (int bi=0; bi<gBodyCount; ++bi) {
             Body *self = &gBodies[bi];
             for (int ni=0; ni<self->nodeCount; ++ni) {
-                if (self->nodes[ni].type == NODE_WEAPON) weaponStepAll(self, ni);
+                //if (self->nodes[ni].type == NODE_WEAPON) weaponStepAll(self, ni);
             }
         }
+        /*
         for (int i=0;i<gBodyCount; ++i) {
             Body *b = &gBodies[i];
             if (!b->topoDirty) continue;
@@ -1703,6 +1564,7 @@ int main(int argc, char **argv) {
             cullDeadNodes(b);
             b->topoDirty = 0;
         }
+        */
 
         updateParticles(dt);
 
